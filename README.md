@@ -29,12 +29,12 @@ All operations well under the 1μs target.
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-- **C++ Matching Engine** — Price-time priority order book with IOC/FOK/iceberg/stop/pegged orders, opening/closing auctions, zero-allocation memory pool
-- **Python Bindings** — pybind11 wrapper exposing the full engine API to Python
-- **Agent Framework** — BaseAgent interface, RandomAgent, Avellaneda-Stoikov MarketMaker
-- **RL Environment** — Gymnasium-compliant env for training trading agents with PPO/SAC
-- **Synthetic Data** — Hawkes process order flow with pre-built scenarios (calm, volatile, flash crash)
-- **Live Dashboard** — WebSocket server + React frontend with price chart, order book, trade feed, agent PnL
+- **C++ Matching Engine**: Price-time priority order book with IOC/FOK/iceberg/stop/pegged orders, opening/closing auctions, zero-allocation memory pool
+- **Python Bindings**: pybind11 wrapper exposing the full engine API to Python
+- **Agent Framework**: BaseAgent interface, RandomAgent, Avellaneda-Stoikov MarketMaker
+- **RL Environment**: Gymnasium-compliant env for training trading agents with PPO/SAC
+- **Synthetic Data**: Hawkes process order flow with pre-built scenarios (calm, volatile, flash crash)
+- **Live Dashboard**: WebSocket server + React frontend with price chart, order book, trade feed, agent PnL
 
 ## Quick Start
 
