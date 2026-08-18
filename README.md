@@ -1,5 +1,7 @@
 # Exchange Simulator
 
+[![CI](https://github.com/krrishapatel/Exchange-Simulator/actions/workflows/ci.yml/badge.svg)](https://github.com/krrishapatel/Exchange-Simulator/actions/workflows/ci.yml)
+
 High-performance simulated exchange with a C++ matching engine, ML trading agents, and live visualization.
 
 ## Performance
