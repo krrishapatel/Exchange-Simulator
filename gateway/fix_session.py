@@ -13,7 +13,6 @@ from enum import Enum, auto
 from typing import Callable, Awaitable
 
 from gateway.fix_parser import (
-    SOH,
     MSG_TYPE_HEARTBEAT,
     MSG_TYPE_TEST_REQUEST,
     MSG_TYPE_LOGON,
@@ -30,7 +29,6 @@ from gateway.fix_parser import (
     TAG_TEXT,
     build_message,
     parse_message,
-    FixParseError,
 )
 
 

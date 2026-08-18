@@ -1,4 +1,4 @@
-"""Avellaneda-Stoikov market maker agent."""
+"""Market maker agent. Named for Avellaneda-Stoikov; see MarketMakerAgent."""
 
 import math
 
@@ -6,17 +6,19 @@ from .base import BaseAgent
 
 
 class MarketMakerAgent(BaseAgent):
-    """Market maker using the Avellaneda-Stoikov optimal quoting model.
+    """Market maker quoting near the touch, with inventory skew and unwinding.
 
-    Computes a reservation price skewed by inventory risk and derives
-    optimal bid/ask quotes. The agent provides liquidity on the bid side,
-    capturing spread by selling inventory when the price drifts favorably.
+    Quotes are placed at or just inside the best bid and ask, skewed by a
+    tick-based function of inventory, with an aggressive unwind once inventory
+    passes a threshold. PnL comes from buying passively at the bid and selling
+    higher.
 
-    The strategy implements the full AS model:
-      - Reservation price adjusts for inventory risk
-      - Optimal spread accounts for adverse selection
-      - Inventory is managed through skewed quoting and selective unwinding
-      - PnL comes from buying low (passively at bid) and selling higher
+    This is NOT the Avellaneda-Stoikov model, despite the class name and the
+    parameters. The AS reservation price and optimal spread are computed in
+    `on_market_data` and deliberately not used, because at these parameter
+    values and this tick size they produce a half-spread of ~6454 ticks and an
+    inventory skew below one tick. See the note there. Treat gamma, sigma, k and
+    dt as inert until they are recalibrated.
 
     Parameters:
         gamma: Risk aversion coefficient (higher = tighter inventory control).
@@ -101,12 +103,12 @@ class MarketMakerAgent(BaseAgent):
         return self._total_buy_cost // self._total_buy_qty
 
     def on_market_data(self, engine, timestamp: int) -> list:
-        """Compute Avellaneda-Stoikov quotes and submit orders.
+        """Compute quotes and submit orders.
 
         Each step:
           1. Cancel previous outstanding orders.
           2. Read current book state.
-          3. Compute AS reservation price and optimal spread.
+          3. Compute the AS quantities, which are currently unused.
           4. Place bid quote (passive liquidity provision).
           5. Place ask quote (passive) and/or aggressive unwind.
         """
@@ -152,21 +154,36 @@ class MarketMakerAgent(BaseAgent):
 
         self._mid_history.append(mid)
 
-        # --- Step 3: Compute Avellaneda-Stoikov parameters ---
+        # --- Step 3: Avellaneda-Stoikov parameters (not wired in) ---
         q = self.inventory
         tau = max(self.dt, 1.0 - self._step * self.dt)
 
-        # Reservation price: r = mid - q * gamma * sigma^2 * tau
-        r = mid - q * self.gamma * (self.sigma ** 2) * tau
-
-        # Optimal spread: delta = gamma * sigma^2 * tau + (2/gamma) * ln(1 + gamma/k)
-        delta = (
+        # NOTE: the two AS quantities below are computed but not used to place the
+        # quotes. They are kept because they are the model this agent is named
+        # for, and because the reason they are unused is worth recording rather
+        # than deleting.
+        #
+        # At the defaults (gamma=0.1, sigma=0.002, k=1.5) and this tick size they
+        # are not usable as written:
+        #
+        #   delta = gamma*sigma^2*tau + (2/gamma)*ln(1 + gamma/k)
+        #         = 4e-7 + 1.2908, so the second term swamps the first and delta
+        #           is ~1.29 price units whatever tau is. Half of that is 6454
+        #           ticks, against a book spread of a few ticks, so quotes placed
+        #           at r +/- delta/2 would never fill.
+        #
+        #   r - mid = -q*gamma*sigma^2*tau, which is 0.01 ticks at q=5, so the
+        #           inventory skew rounds away to nothing.
+        #
+        # Making this a real AS agent needs gamma, sigma and k recalibrated for
+        # this price scale, not a rewrite of the quoting below. Until then the
+        # quoting is the tick-based heuristic in steps 4 and 5, and the class
+        # docstring says so.
+        r = mid - q * self.gamma * (self.sigma ** 2) * tau  # noqa: F841
+        delta = (  # noqa: F841
             self.gamma * (self.sigma ** 2) * tau
             + (2.0 / self.gamma) * math.log(1.0 + self.gamma / self.k)
         )
-
-        # Convert reservation price to fixed-point
-        r_fixed = int(round(r * 10000))
 
         # --- Step 4: Place bid (passive buy) ---
         # Quote at or slightly above best bid to be first in queue
@@ -174,7 +191,7 @@ class MarketMakerAgent(BaseAgent):
         if spread > 2:
             bid_price = best_bid + 1
 
-        # Apply AS skew to bid: when long, lower bid to discourage buying
+        # Tick-based inventory skew: when long, lower bid to discourage buying
         if q > 0:
             skew_down = min(q // 5, spread // 3)  # reduce aggressiveness
             bid_price -= skew_down

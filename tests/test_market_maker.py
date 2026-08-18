@@ -218,7 +218,7 @@ class TestMarketMakerIntegration:
 
         agents = [mm] + randoms
         sim = SimulationLoop(agents, num_steps=5000)
-        results = sim.run()
+        sim.run()
 
         # Inventory should be bounded (within 3x max due to unwind mechanism)
         assert abs(mm.inventory) < mm.max_inventory * 3, (

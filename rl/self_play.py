@@ -19,7 +19,6 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-import numpy as np
 
 
 class OpponentPool:
@@ -227,7 +226,7 @@ class SelfPlayCallback:
             if self.verbose:
                 print(
                     f"  [SelfPlay] Snapshot saved: gen {self.opponent_pool.generation} "
-                    f"(pool size: {self.opponent_pool.size})"
+                    f"(pool size: {self.opponent_pool.size}) -> {path}"
                 )
 
             # Update the env's opponent pool
@@ -321,7 +320,7 @@ def train_self_play(
     sb3_callback = SB3SelfPlayCallback(sp_callback, verbose=verbose)
 
     if verbose:
-        print(f"Starting self-play training:")
+        print("Starting self-play training:")
         print(f"  Total timesteps: {total_timesteps}")
         print(f"  Pool size: {pool_size}")
         print(f"  Snapshot interval: {snapshot_interval}")
@@ -359,7 +358,7 @@ def train_self_play(
         print(f"\nTraining complete in {elapsed:.1f}s")
         print(f"Final model saved to: {model_save_path}.zip")
         print(f"Opponent pool generations: {pool.generation}")
-        print(f"\nRunning evaluation against pool...")
+        print("\nRunning evaluation against pool...")
 
     # Evaluate against each generation
     win_rates = _evaluate_against_pool(model, pool, env, num_episodes=5)

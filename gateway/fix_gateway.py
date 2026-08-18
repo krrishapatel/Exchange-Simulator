@@ -8,14 +8,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from datetime import datetime, timezone
 from typing import Any
 
 import exchange_simulator as ex
 
 from gateway.fix_parser import (
-    SOH,
     MSG_TYPE_NEW_ORDER_SINGLE,
     MSG_TYPE_ORDER_CANCEL_REQUEST,
     MSG_TYPE_EXECUTION_REPORT,
@@ -41,7 +39,7 @@ from gateway.fix_parser import (
     extract_message,
     FixParseError,
 )
-from gateway.fix_session import FixSession, SessionState
+from gateway.fix_session import FixSession
 
 logger = logging.getLogger(__name__)
 

@@ -15,8 +15,12 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from rl.self_play_env import OpponentPolicy
 
 
 def compute_sharpe_ratio(returns: np.ndarray, risk_free_rate: float = 0.0) -> float:
@@ -102,8 +106,7 @@ def run_evaluation(
         )
         sys.exit(1)
 
-    from rl.self_play_env import OpponentPolicy, SelfPlayEnv
-    import random
+    from rl.self_play_env import SelfPlayEnv
 
     if opponents is None:
         opponents = ["random", "market_maker"]

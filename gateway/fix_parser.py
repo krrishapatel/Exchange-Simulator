@@ -98,18 +98,11 @@ def parse_message(raw: str) -> dict[str, str]:
 
     # Validate checksum if present
     if TAG_CHECKSUM in fields:
-        # Checksum is computed over everything up to (but not including) the 10= field
-        checksum_field = f"{TAG_CHECKSUM}={fields[TAG_CHECKSUM]}{SOH}"
-        # Find where the checksum field starts in the original message
-        body_for_checksum = raw.split(f"{SOH}{TAG_CHECKSUM}=")[0] + SOH
-        # But we need the full message with SOH up to the checksum tag
-        # Reconstruct: everything before "10=XXX"
+        # The checksum covers everything up to but not including the 10= field.
         idx = (raw + SOH).rfind(f"{SOH}{TAG_CHECKSUM}=")
-        if idx == -1:
-            # checksum is first field (shouldn't happen but handle it)
-            body_for_checksum = ""
-        else:
-            body_for_checksum = raw[:idx] + SOH
+        # A checksum as the first field is malformed. Leave that to the
+        # comparison below rather than guessing at a body here.
+        body_for_checksum = "" if idx == -1 else raw[:idx] + SOH
 
         expected = compute_checksum(body_for_checksum)
         if fields[TAG_CHECKSUM] != expected:

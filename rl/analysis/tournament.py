@@ -13,7 +13,7 @@ import argparse
 import itertools
 import sys
 from pathlib import Path
-from typing import Any, Callable
+from typing import Callable
 
 import numpy as np
 
@@ -249,7 +249,9 @@ class Tournament:
         """Default simulation using random PnL for testing purposes.
 
         In production, this should be replaced with actual environment simulation.
-        This fallback generates plausible PnL values based on action distributions.
+        The PnL here is drawn from a fixed distribution and does not depend on
+        either agent, so it exercises the bookkeeping and says nothing about who
+        is stronger.
 
         Args:
             agent_a: First agent.
@@ -265,10 +267,6 @@ class Tournament:
         results = []
 
         for ep in range(num_episodes):
-            # Generate random observations and simulate actions
-            obs = rng.standard_normal(11).astype(np.float32)
-
-            # Simple PnL model: action variety helps
             pnl_a = float(rng.normal(0, 100))
             pnl_b = float(rng.normal(0, 100))
 

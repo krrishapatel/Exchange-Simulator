@@ -6,8 +6,8 @@ is not installed. All plots are saved to the analysis_output/ directory.
 
 from __future__ import annotations
 
+import importlib.util
 import json
-import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -15,7 +15,6 @@ import numpy as np
 
 if TYPE_CHECKING:
     from rl.analysis.convergence import ConvergenceTracker
-    from rl.analysis.elo import EloRating
 
 # Output directory for all plots
 OUTPUT_DIR = Path("analysis_output")
@@ -29,12 +28,9 @@ def _ensure_output_dir() -> Path:
 
 def _has_matplotlib() -> bool:
     """Check if matplotlib is available."""
-    try:
-        import matplotlib
-
-        return True
-    except ImportError:
-        return False
+    # find_spec rather than a try/import, so this is an availability check and
+    # not an import whose unused name a linter has to be told to ignore.
+    return importlib.util.find_spec("matplotlib") is not None
 
 
 def plot_convergence(tracker: "ConvergenceTracker", output_dir: str | None = None) -> str:

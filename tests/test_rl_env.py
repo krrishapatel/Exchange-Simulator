@@ -1,7 +1,6 @@
 """Tests for the RL trading environment."""
 
 import numpy as np
-import pytest
 
 import gymnasium
 from gymnasium.utils.env_checker import check_env

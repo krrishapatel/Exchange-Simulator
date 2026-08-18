@@ -3,7 +3,6 @@
 import argparse
 import asyncio
 import logging
-import sys
 
 import exchange_simulator as ex
 

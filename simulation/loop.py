@@ -1,6 +1,5 @@
 """Simulation loop that drives agents against the matching engine."""
 
-import sys
 
 
 class SimulationLoop:

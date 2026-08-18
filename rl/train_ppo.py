@@ -40,7 +40,6 @@ def main():
 
     try:
         from stable_baselines3 import PPO
-        from stable_baselines3.common.env_util import make_vec_env
     except ImportError:
         print(
             "ERROR: stable-baselines3 is required for training.\n"
