@@ -8,5 +8,6 @@ compile_commands.json
 __pycache__/
 *.pyc
 .pytest_cache/
+*.egg-info/
 node_modules/
 dashboard/frontend/dist/
