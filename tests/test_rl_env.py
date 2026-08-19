@@ -211,3 +211,78 @@ class TestTradingEnvGymCompliance:
             if terminated or truncated:
                 break
         env.close()
+
+
+class TestTradingEnvReward:
+    """The reward has to track profit, not cash.
+
+    `_agent_pnl` is cash flow: a buy subtracts the whole notional. Rewarding its
+    change directly makes selling look good and buying look catastrophic no
+    matter what the prices were. Measured over 500 steps before this was fixed,
+    always-buy-market scored -500,005,283 while being the most profitable policy
+    at +31,592 marked, and always-sell-market scored +499,927,312 for half the
+    profit. These tests pin the reward to marked equity so that cannot come back.
+    """
+
+    PENALTY = 0.001
+
+    def _roll(self, action, steps=300, seed=7):
+        """Run one fixed-action episode, returning reward and equity totals."""
+        env = TradingEnv(
+            episode_length=steps, inventory_penalty=self.PENALTY, seed=seed
+        )
+        env.reset(seed=seed)
+        total_reward = 0.0
+        total_penalty = 0.0
+        info = {}
+        for _ in range(steps):
+            _, reward, terminated, truncated, info = env.step(action)
+            total_reward += reward
+            total_penalty += self.PENALTY * abs(info["inventory"])
+            if terminated or truncated:
+                break
+        return total_reward, total_penalty, info
+
+    def test_reward_sums_to_marked_equity(self):
+        """Rewards telescope to final marked equity, less the penalties charged.
+
+        On the cash-based reward this sum came out at the cash balance instead,
+        which for a buying policy is hundreds of millions away from the truth.
+        """
+        for action in range(5):
+            total_reward, total_penalty, info = self._roll(action)
+            expected = info["equity"]
+            assert abs(total_reward + total_penalty - expected) < 1.0, (
+                f"action {action}: rewards sum to "
+                f"{total_reward + total_penalty:.0f} but equity is {expected:.0f}"
+            )
+
+    def test_buying_is_not_punished_for_being_a_purchase(self):
+        """Buying at the touch costs the spread, not the notional."""
+        total_reward, _, info = self._roll(2)  # buy market every step
+        assert info["inventory"] > 0, "buy_market should end long"
+        # The old reward was about -1e6 per share bought.
+        assert total_reward > -10 * info["inventory"], (
+            f"reward {total_reward:.0f} for {info['inventory']} shares looks like "
+            "the notional is being charged rather than the spread"
+        )
+
+    def test_reward_ranks_profitable_policies_above_losing_ones(self):
+        """Every policy that made money must score above every one that lost it.
+
+        Not a full ordering: the inventory penalty is part of the objective, so
+        two policies within a penalty's width of each other can legitimately
+        swap. What must never happen is the old behaviour, where the losing
+        policies scored half a billion above the winning ones.
+        """
+        scored = []
+        for action in range(5):
+            total_reward, _, info = self._roll(action)
+            scored.append((action, total_reward, info["equity"]))
+
+        winners = [row for row in scored if row[2] > 0]
+        losers = [row for row in scored if row[2] < 0]
+        assert winners and losers, f"need both to compare, got {scored}"
+        assert min(r for _, r, _ in winners) > max(r for _, r, _ in losers), (
+            f"reward puts a losing policy above a profitable one: {scored}"
+        )

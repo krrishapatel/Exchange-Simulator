@@ -178,6 +178,10 @@ class SelfPlayEnv(gym.Env):
         # Fill routing
         self._order_to_agent: dict[int, RandomAgent] = {}
 
+        # Marked-equity baselines for the reward
+        self._prev_agent_equity = 0.0
+        self._prev_opp_equity = 0.0
+
         # Episode stats
         self._episode_agent_pnl = 0.0
         self._episode_opp_pnl = 0.0
@@ -280,6 +284,10 @@ class SelfPlayEnv(gym.Env):
             timestamp = warmup_step * 1_000_000
             self._run_noise_traders(timestamp)
 
+        # Reward baselines, set after warmup. Both zero, nothing is held yet.
+        self._prev_agent_equity = self._marked_equity(0, 0.0)
+        self._prev_opp_equity = self._marked_equity(0, 0.0)
+
         obs = self._get_observation()
         info = self._get_info()
         return obs, info
@@ -311,9 +319,15 @@ class SelfPlayEnv(gym.Env):
         # 3. Run noise traders
         self._run_noise_traders(timestamp)
 
-        # 4. Compute reward (competitive)
-        agent_pnl_delta = self._agent_pnl - self._prev_agent_pnl
-        opp_pnl_delta = self._opp_pnl - self._prev_opp_pnl
+        # 4. Compute reward (competitive), on marked equity rather than cash.
+        # See _marked_equity: the cash delta rewards selling by the full notional
+        # and punishes buying the same way, which is not profit.
+        agent_equity = self._marked_equity(self._agent_inventory, self._agent_pnl)
+        opp_equity = self._marked_equity(self._opp_inventory, self._opp_pnl)
+        agent_pnl_delta = agent_equity - self._prev_agent_equity
+        opp_pnl_delta = opp_equity - self._prev_opp_equity
+        self._prev_agent_equity = agent_equity
+        self._prev_opp_equity = opp_equity
         inv_penalty = self.inventory_penalty * abs(self._agent_inventory)
 
         # Blend absolute and relative reward
@@ -335,6 +349,29 @@ class SelfPlayEnv(gym.Env):
         info = self._get_info()
 
         return obs, reward, terminated, truncated, info
+
+    def _mid_price(self) -> float:
+        """Current mid in fixed-point, falling back to the last usable price."""
+        book = self._engine.book()
+        best_bid = book.best_bid_price()
+        best_ask = book.best_ask_price()
+        if best_bid is not None and best_ask is not None:
+            return (best_bid + best_ask) / 2.0
+        if best_bid is not None:
+            return float(best_bid)
+        if best_ask is not None:
+            return float(best_ask)
+        return float(self._BASE_PRICE)
+
+    def _marked_equity(self, inventory: int, pnl: float) -> float:
+        """Cash plus inventory valued at the mid.
+
+        Both the reward and the win/loss call need this. Comparing raw cash
+        across two agents decides the match on who is holding less stock rather
+        than on who traded better: the one left long has paid out cash for
+        something the comparison does not count.
+        """
+        return pnl + inventory * self._mid_price()
 
     def _execute_action(
         self, action: int, timestamp: int, is_opponent: bool
@@ -560,12 +597,21 @@ class SelfPlayEnv(gym.Env):
     def get_episode_result(self) -> dict:
         """Get end-of-episode results for win/loss tracking.
 
+        PnL is marked to market at the closing mid, so a player holding stock at
+        the end is judged on what it is worth rather than on the cash it spent.
+
         Returns:
             Dict with agent_pnl, opponent_pnl, and win flag.
         """
+        agent_equity = self._marked_equity(self._agent_inventory, self._agent_pnl)
+        opp_equity = self._marked_equity(self._opp_inventory, self._opp_pnl)
         return {
-            "agent_pnl": self._agent_pnl,
-            "opponent_pnl": self._opp_pnl,
-            "agent_won": self._agent_pnl > self._opp_pnl,
+            "agent_pnl": agent_equity,
+            "opponent_pnl": opp_equity,
+            "agent_cash": self._agent_pnl,
+            "opponent_cash": self._opp_pnl,
+            "agent_inventory": self._agent_inventory,
+            "opponent_inventory": self._opp_inventory,
+            "agent_won": agent_equity > opp_equity,
             "opponent_name": getattr(self._active_opponent, "name", "unknown"),
         }

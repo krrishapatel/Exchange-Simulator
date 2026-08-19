@@ -83,6 +83,7 @@ class TradingEnv(gym.Env):
         self._agent_inventory = 0
         self._agent_pnl = 0.0
         self._prev_pnl = 0.0
+        self._prev_equity = 0.0
         self._order_id_counter = 0
         self._my_order_ids: set[int] = set()
         self._order_to_agent: dict[int, RandomAgent] = {}
@@ -117,6 +118,7 @@ class TradingEnv(gym.Env):
         self._agent_inventory = 0
         self._agent_pnl = 0.0
         self._prev_pnl = 0.0
+        self._prev_equity = 0.0
         self._order_id_counter = 900_000_000  # High range to avoid collisions
         self._my_order_ids = set()
         self._order_to_agent = {}
@@ -132,6 +134,10 @@ class TradingEnv(gym.Env):
         for warmup_step in range(50):
             timestamp = warmup_step * 1_000_000
             self._run_noise_traders(timestamp)
+
+        # Baseline for the reward, set after warmup so the first step is not
+        # charged for the book appearing. Zero here, since nothing is held yet.
+        self._prev_equity = self._marked_equity()
 
         obs = self._get_observation()
         info = self._get_info()
@@ -159,10 +165,11 @@ class TradingEnv(gym.Env):
         # Run noise traders for this step
         self._run_noise_traders(timestamp)
 
-        # Calculate reward
-        pnl_delta = self._agent_pnl - self._prev_pnl
+        # Reward is the change in marked equity, not the change in cash.
+        equity = self._marked_equity()
         inv_penalty = self.inventory_penalty * abs(self._agent_inventory)
-        reward = float(pnl_delta - inv_penalty)
+        reward = float(equity - self._prev_equity - inv_penalty)
+        self._prev_equity = equity
         self._prev_pnl = self._agent_pnl
 
         # Check termination
@@ -173,6 +180,35 @@ class TradingEnv(gym.Env):
         info = self._get_info()
 
         return obs, reward, terminated, truncated, info
+
+    def _mid_price(self) -> float:
+        """Current mid in fixed-point, falling back to the last usable price."""
+        book = self._engine.book()
+        best_bid = book.best_bid_price()
+        best_ask = book.best_ask_price()
+        if best_bid is not None and best_ask is not None:
+            return (best_bid + best_ask) / 2.0
+        if best_bid is not None:
+            return float(best_bid)
+        if best_ask is not None:
+            return float(best_ask)
+        return float(self._BASE_PRICE)
+
+    def _marked_equity(self) -> float:
+        """Cash plus inventory valued at the mid.
+
+        ``_agent_pnl`` is cash flow only: a buy subtracts the full notional and a
+        sell adds it, so it says nothing about whether a trade was good. Valuing
+        the position closes that gap, and the difference is not subtle. Rewarding
+        the cash delta directly ranked the fixed policies close to backwards over
+        500 steps: always-buy-market scored -500,005,283 while actually being the
+        most profitable policy at +31,592 marked, and always-sell-market scored
+        +499,927,312 for half that profit. An agent trained on the cash delta
+        learns to sell whatever it holds and never buy, because selling pays the
+        full notional up front and the reward never accounts for what was given
+        away.
+        """
+        return self._agent_pnl + self._agent_inventory * self._mid_price()
 
     def _execute_action(self, action: int, timestamp: int) -> None:
         """Translate the discrete action into an order and submit it.
@@ -363,9 +399,14 @@ class TradingEnv(gym.Env):
         return [total * w / weight_sum for w in weights]
 
     def _get_info(self) -> dict:
-        """Return auxiliary info dictionary."""
+        """Return auxiliary info dictionary.
+
+        ``pnl`` is cash flow, ``equity`` is cash plus inventory at the mid. Judge
+        a policy on ``equity``; ``pnl`` on its own makes buying look like a loss.
+        """
         return {
             "inventory": self._agent_inventory,
             "pnl": self._agent_pnl,
+            "equity": self._marked_equity(),
             "step": self._step_count,
         }
