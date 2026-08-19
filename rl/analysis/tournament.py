@@ -115,6 +115,58 @@ class MatchResult:
         return 0.5
 
 
+def simulate_match(
+    agent_a: AgentEntry,
+    agent_b: AgentEntry,
+    num_episodes: int,
+    episode_length: int,
+    seed: int,
+) -> list[MatchResult]:
+    """Play two agents against each other in the order book.
+
+    Both agents act on the same engine against shared noise traders, so they
+    compete for the same fills rather than being scored in separate runs. PnL is
+    marked to market at the closing mid, so an agent left holding stock is judged
+    on what it is worth.
+
+    Args:
+        agent_a: First agent, drives the env's action.
+        agent_b: Second agent, plays as the opponent.
+        num_episodes: Episodes to play.
+        episode_length: Steps per episode.
+        seed: Base seed; each episode uses seed + episode index.
+
+    Returns:
+        One MatchResult per episode.
+    """
+    from rl.self_play_env import OpponentPolicy, SelfPlayEnv
+
+    opponent = OpponentPolicy(action_fn=agent_b.predict, name=agent_b.name)
+    env = SelfPlayEnv(
+        opponent_policies=[opponent],
+        episode_length=episode_length,
+        seed=seed,
+    )
+
+    results = []
+    for episode in range(num_episodes):
+        obs, _ = env.reset(seed=seed + episode)
+        for _ in range(episode_length):
+            obs, _, terminated, truncated = env.step(agent_a.predict(obs))[:4]
+            if terminated or truncated:
+                break
+        outcome = env.get_episode_result()
+        results.append(
+            MatchResult(
+                player_a=agent_a.name,
+                player_b=agent_b.name,
+                pnl_a=outcome["agent_pnl"],
+                pnl_b=outcome["opponent_pnl"],
+            )
+        )
+    return results
+
+
 class Tournament:
     """Round-robin tournament runner for comparing agents.
 
@@ -167,7 +219,8 @@ class Tournament:
                     sim_fn(agent_a: AgentEntry, agent_b: AgentEntry,
                            num_episodes: int, episode_length: int, seed: int)
                     -> list[MatchResult]
-                    If None, uses a simple PnL comparison heuristic.
+                    Defaults to `simulate_match`, which plays the agents against
+                    each other in the order book.
 
         Returns:
             Dict with keys:
@@ -180,7 +233,7 @@ class Tournament:
                 - 'num_matchups': total matchups played
         """
         if sim_fn is None:
-            sim_fn = self._default_simulate
+            sim_fn = simulate_match
 
         matchups = list(itertools.combinations(range(len(self.agents)), 2))
 
@@ -238,7 +291,7 @@ class Tournament:
             "num_matchups": self.num_matchups,
         }
 
-    def _default_simulate(
+    def _synthetic_simulate(
         self,
         agent_a: AgentEntry,
         agent_b: AgentEntry,
@@ -246,12 +299,14 @@ class Tournament:
         episode_length: int,
         seed: int,
     ) -> list[MatchResult]:
-        """Default simulation using random PnL for testing purposes.
+        """Draw PnL from a fixed distribution, ignoring both agents.
 
-        In production, this should be replaced with actual environment simulation.
-        The PnL here is drawn from a fixed distribution and does not depend on
-        either agent, so it exercises the bookkeeping and says nothing about who
-        is stronger.
+        For exercising the Elo and win-rate bookkeeping without paying for a
+        simulation. Pass it explicitly as `run(sim_fn=...)`; it is not the
+        default and must never be, because the numbers say nothing about who is
+        stronger while looking exactly like numbers that do. It used to be the
+        default, so `python -m rl.analysis.tournament` printed a confident Elo
+        ranking of your checkpoints that was pure noise.
 
         Args:
             agent_a: First agent.
