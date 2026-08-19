@@ -128,7 +128,11 @@ pip install ".[rl]"
 PYTHONPATH=build/bindings:. python3 -m rl.train_ppo --total-timesteps 1000000
 
 # Self-play training (league-style opponent pool)
-PYTHONPATH=build/bindings:. python3 rl/self_play.py --total-timesteps 500000 --pool-size 10
+PYTHONPATH=build/bindings:. python3 rl/self_play.py --timesteps 500000 --pool-size 10
+
+# Ask whether later self-play checkpoints beat earlier ones (see Status)
+PYTHONPATH=build/bindings:. python3 -m rl.analysis.league \
+    --pool-dir models/opponent_pool --snapshot-interval 50000
 
 # Evaluate a trained model
 PYTHONPATH=build/bindings:. python3 rl/evaluate.py --model models/ppo_trader.zip --episodes 100
@@ -265,10 +269,26 @@ engine.submit(2, sell_order)  # Symbol 2 (isolated book)
 - [x] FIX protocol gateway. Parser and session layer, 14 tests. The four TCP
       integration tests are skipped and hang if forced, so the transport itself
       is not verified.
-- [ ] League-style self-play convergence. `SelfPlayEnv` runs real matches and
-      both players now requote and share one position limit, but the convergence
-      result above is single-agent. No Elo curve has been produced from a league
-      of trained checkpoints playing each other.
+- [x] League-style self-play convergence, and it does not converge to a skill
+      ladder. Training PPO in self-play for 300k steps, snapshotting every 50k,
+      gives seven checkpoints; running them plus a random anchor through an
+      all-pairs round-robin (30 episodes each, marked to market) produces the
+      Elo curve. The random anchor is crushed, scoring 0.03 against every trained
+      generation, so the tournament tells policies apart. Among the trained
+      generations there is no ladder: the correlation between training step and
+      round-robin score is -0.11, the 50k checkpoint tops the table and the fully
+      trained 300k one sits near the bottom of the trained gens, and the win
+      matrix is a non-transitive muddle around 0.5. Confirmed on a second seed
+      set, where 50k again led and the correlation was -0.25. This is the
+      expected failure mode of naive self-play without a real league mechanism:
+      more steps chase the current opponent rather than accumulate skill, and the
+      low inventory penalty here rewards competing for fills over absolute equity.
+      It also lines up with the single-agent result above, where extra training
+      matched the heuristic rather than beating it. Reproduce with
+      `python rl/self_play.py` then
+      `python -m rl.analysis.league --pool-dir models/opponent_pool --snapshot-interval 50000`.
+      Scores are order-independent and the Elo is averaged over 200 random match
+      orderings, so neither number depends on the order matches were scored in.
 
 ## License
 

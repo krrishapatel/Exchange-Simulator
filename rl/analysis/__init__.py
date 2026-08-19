@@ -9,6 +9,7 @@ Provides:
 
 from rl.analysis.convergence import ConvergenceTracker
 from rl.analysis.elo import EloRating
+from rl.analysis.league import run_league
 from rl.analysis.tournament import Tournament
 from rl.analysis.visualize import (
     plot_convergence,
@@ -21,6 +22,7 @@ __all__ = [
     "ConvergenceTracker",
     "EloRating",
     "Tournament",
+    "run_league",
     "plot_convergence",
     "plot_elo_progression",
     "plot_pnl_distribution",
