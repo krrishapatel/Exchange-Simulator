@@ -11,6 +11,24 @@ from agents import BaseAgent, RandomAgent
 from simulation import SimulationLoop
 
 
+def _limit(oid, side, price, qty=10):
+    """Build a resting GTC limit order."""
+    o = ex.Order()
+    o.id = oid
+    o.side = side
+    o.price = price
+    o.quantity = qty
+    o.type = ex.OrderType.Limit
+    o.tif = ex.TimeInForce.GTC
+    o.timestamp = 0
+    o.filled_quantity = 0
+    o.stop_price = 0
+    o.peg_offset = 0
+    o.visible_quantity = 0
+    o.hidden_quantity = 0
+    return o
+
+
 class TestBaseAgent:
     """Tests for the BaseAgent abstract class."""
 
@@ -108,6 +126,54 @@ class TestRandomAgent:
         mid = (100_0000 + 101_0000) // 2
         # Order should be within tick_range (5) * 100 of mid
         assert abs(order.price - mid) <= 5 * 100
+
+    def test_passive_orders_do_not_cross(self):
+        """An offset of 0 must stay on its own side of the mid.
+
+        This is the bias that made the agent a one-way seller: with a floored
+        mid, a sell at offset 0 landed exactly on the bid and traded, while a buy
+        at offset 0 sat below the ask and never could.
+        """
+        engine = ex.MatchingEngine()
+        engine.submit(_limit(99001, ex.Side.Buy, 100_0000))
+        engine.submit(_limit(99002, ex.Side.Sell, 100_0001))  # one unit wide
+
+        for seed in range(200):
+            agent = RandomAgent(agent_id=1, seed=seed, aggression=0.0)
+            for order in agent.on_market_data(engine, timestamp=1000):
+                if order.side == ex.Side.Buy:
+                    assert order.price < 100_0001, "passive buy reached the ask"
+                else:
+                    assert order.price > 100_0000, "passive sell reached the bid"
+
+    def test_aggression_is_two_sided(self):
+        """Crossing orders are split evenly between buys and sells.
+
+        The old agent submitted a balanced 50/50 mix of sides and then crossed on
+        the sell side only, so every trade in the simulator was a sell and the
+        price could only fall.
+        """
+        engine = ex.MatchingEngine()
+        traders = [RandomAgent(agent_id=i, seed=i * 13) for i in range(1, 4)]
+        crossed = {"Buy": 0, "Sell": 0}
+
+        for step in range(2000):
+            for trader in traders:
+                book = engine.book()
+                two_sided = (
+                    book.best_bid_price() is not None
+                    and book.best_ask_price() is not None
+                )
+                for order in trader.on_market_data(engine, step * 1_000_000):
+                    if engine.submit(order) and two_sided:
+                        crossed[order.side.name] += 1
+
+        total = crossed["Buy"] + crossed["Sell"]
+        assert total > 100, f"expected some trading, got {total} crossings"
+        buy_share = crossed["Buy"] / total
+        assert 0.35 < buy_share < 0.65, (
+            f"crossings are {buy_share:.0%} buys, so flow is one-directional"
+        )
 
 
 class TestSimulationLoop:
