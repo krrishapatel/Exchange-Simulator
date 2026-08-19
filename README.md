@@ -33,7 +33,7 @@ All operations well under the 1μs target.
 
 - **C++ Matching Engine**: Price-time priority order book with IOC/FOK/iceberg/stop/pegged orders, opening/closing auctions, zero-allocation memory pool
 - **Python Bindings**: pybind11 wrapper exposing the full engine API to Python
-- **Agent Framework**: BaseAgent interface, RandomAgent, Avellaneda-Stoikov MarketMaker
+- **Agent Framework**: BaseAgent interface, RandomAgent, MarketMaker (quotes at the touch with inventory skew)
 - **RL Environment**: Gymnasium-compliant env for training trading agents with PPO/SAC
 - **Synthetic Data**: Hawkes process order flow with pre-built scenarios (calm, volatile, flash crash)
 - **Live Dashboard**: WebSocket server + React frontend with price chart, order book, trade feed, agent PnL
@@ -74,7 +74,7 @@ exchange-simulator/
 ├── agents/
 │   ├── base.py                    # BaseAgent interface
 │   ├── random_agent.py            # Noise trader
-│   └── market_maker.py            # Avellaneda-Stoikov MM
+│   └── market_maker.py            # Market maker, quotes at the touch
 ├── rl/
 │   ├── trading_env.py             # Gymnasium environment
 │   └── train_ppo.py               # PPO training script
@@ -108,7 +108,7 @@ exchange-simulator/
 | Agent | Strategy |
 |-------|----------|
 | RandomAgent | Uniform random orders around mid (noise) |
-| MarketMakerAgent | Avellaneda-Stoikov optimal quoting with inventory skew |
+| MarketMakerAgent | Quotes at or inside the touch, tick-based inventory skew, aggressive unwind |
 | RL Agent | PPO-trained via Gymnasium environment |
 
 ## Benchmarks
@@ -168,7 +168,11 @@ engine.submit(2, sell_order)  # Symbol 2 (isolated book)
 - [x] Auction phases (opening/closing uncross)
 - [x] Python bindings (pybind11)
 - [x] Agent framework (classical strategies)
-- [x] Avellaneda-Stoikov market maker
+- [x] Market maker (quotes at the touch, inventory skew, unwind)
+- [ ] Avellaneda-Stoikov quoting. The formulas are in `market_maker.py` but are
+      not wired into the quotes: at the default gamma, sigma and k the optimal
+      half-spread comes out around 6454 ticks, so the quotes would never fill.
+      Needs those three recalibrated for this price scale.
 - [x] Gymnasium RL environment
 - [x] Self-play RL training (league-style)
 - [x] Synthetic data generator (Hawkes process)
@@ -177,8 +181,14 @@ engine.submit(2, sell_order)  # Symbol 2 (isolated book)
 - [x] Live dashboard (WebSocket + React)
 - [x] Latency histogram panel
 - [x] Multi-asset matching engine
-- [ ] Deep RL self-play convergence analysis
-- [ ] FIX protocol gateway
+- [x] FIX protocol gateway. Parser and session layer, 14 tests. The four TCP
+      integration tests are skipped and hang if forced, so the transport itself
+      is not verified.
+- [ ] Deep RL self-play convergence analysis. The tracker and the Elo table are
+      implemented and tested, but `Tournament` falls back to
+      `_default_simulate`, which draws PnL from a fixed distribution and ignores
+      both agents. So the plumbing works and no convergence result has actually
+      been produced.
 - [ ] Order book imbalance features for ML
 
 ## License

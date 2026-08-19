@@ -1,4 +1,9 @@
-"""Tests for the Avellaneda-Stoikov market maker agent."""
+"""Tests for the market maker agent.
+
+These cover the quoting that is actually in use: two-sided quotes at the touch,
+tick-based inventory skew, and the unwind. The Avellaneda-Stoikov formulas in
+`market_maker.py` are not wired into the quotes, so nothing here tests them.
+"""
 
 import sys
 import os
