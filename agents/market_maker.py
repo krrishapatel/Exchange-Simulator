@@ -23,12 +23,19 @@ class MarketMakerAgent(BaseAgent):
     model itself does not provide and which exists because the skew goes to zero
     as tau does.
 
+    This is a faithful implementation of the model, not the best quoter in this
+    repo. Over 10 seeds it loses to simply resting at the touch, on PnL in 10 out
+    of 10 of them. The model prices a quote against an order arrival intensity
+    that decays exponentially in the distance from the mid, and RandomAgent
+    crosses at a fixed probability regardless of distance, so the spread this
+    computes is optimal for a market that is not the one it is quoting into.
+
     The defaults are calibrated for this simulator's price scale, which matters
     more than it sounds. The formulas are in price units, one tick is 0.0001,
-    and the book spread is one tick in about 98% of steps. Measured from a
+    and the book spread is one tick in about 99% of steps. Measured from a
     5000-step run against three RandomAgents:
 
-        sigma  0.00024   the per-step stdev of the mid, measured at 0.000242
+        sigma  0.00024   the per-step stdev of the mid, measured at 0.000234
         gamma  230       set so the skew reaches ~2 ticks at q = max_inventory
                          while tau is still near 1
         k      23000     set so delta comes out near one tick, which is what

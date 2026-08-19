@@ -36,7 +36,7 @@ def _order(oid, side, price, qty=10):
 
 
 def _one_tick_book():
-    """A book one tick wide, which is what the simulator produces ~98% of steps."""
+    """A book one tick wide, which is what the simulator produces ~99% of steps."""
     engine = ex.MatchingEngine()
     engine.submit(_order(99001, ex.Side.Buy, 100_0000))
     engine.submit(_order(99002, ex.Side.Sell, 100_0001))

@@ -107,7 +107,7 @@ exchange-simulator/
 
 | Agent | Strategy |
 |-------|----------|
-| RandomAgent | Uniform random orders around mid (noise) |
+| RandomAgent | Uniform random orders around mid, 8% of them crossing (noise) |
 | MarketMakerAgent | Avellaneda-Stoikov quoting, inventory skew, aggressive unwind |
 | RL Agent | PPO-trained via Gymnasium environment |
 
@@ -168,15 +168,39 @@ engine.submit(2, sell_order)  # Symbol 2 (isolated book)
 - [x] Auction phases (opening/closing uncross)
 - [x] Python bindings (pybind11)
 - [x] Agent framework (classical strategies)
+- [x] Two-sided noise trader flow. `RandomAgent` took the mid as
+      `(best_bid + best_ask) // 2`, which floors onto the bid, so a sell placed at
+      the mid landed on the bid and traded while a buy placed at the mid sat below
+      the ask and never could. Sides were still drawn 50/50, so the flow looked
+      balanced: 4557 buys and 4444 sells submitted over 3000 steps, 696 crossings,
+      every one of them a sell, and the price walked monotonically down. Crossing
+      is now an explicit symmetric probability, defaulted to the 7.7% rate the
+      rounding accident produced. Any measurement taken before this is worthless.
+- [x] RL reward on marked equity. Reward was the change in cash, which charges
+      the full notional for a buy and credits it for a sell, so it ranked fixed
+      policies close to backwards: over 500 steps always-buy-market scored
+      -500,005,283 while being the most profitable policy at +31,592 marked, and
+      always-sell-market scored +499,927,312 for half that profit. Anything
+      trained on it learned to liquidate. Reward is now the change in cash plus
+      inventory valued at the mid, in both `TradingEnv` and `SelfPlayEnv`.
+- [x] Round-robin tournament with Elo. Matches run through `SelfPlayEnv`, so both
+      agents compete for the same fills on one engine and are scored on
+      marked-to-market PnL. This used to draw both players' PnL from
+      `rng.normal(0, 100)`, so `python -m rl.analysis.tournament` printed a
+      confident Elo ranking of your checkpoints that ignored the checkpoints. It
+      had no tests, which is why nobody noticed.
 - [x] Avellaneda-Stoikov market maker. Quotes at the reservation price plus and
       minus half the optimal spread, with an aggressive unwind past
       `max_inventory`. gamma, sigma and k are calibrated to this price scale from
-      measured mid volatility and book spread, since the formulas are in price
-      units and the book is in ticks. Against the previous tick heuristic over 10
-      seeds it takes 24.7 fills per run instead of 4.9, sells in 10/10 runs
-      instead of 0/10, and ends flatter in 9/10. Mark-to-market PnL is better in
-      6/10, which is noise, and still negative: it is quoting into uninformed
-      flow with no queue priority, so this is not a profitable strategy.
+      the measured per-step mid volatility (0.000234) and book spread (one unit in
+      99% of steps), since the formulas are in price units and the book is in
+      ticks. It is a correct implementation of the model and it is not the best
+      quoter here: over 10 seeds against a plain touch-quoting heuristic it takes
+      9.1 fills per run against 10.7 and returns -69 marked to market against
+      +887, worse in 10 out of 10 seeds. 89% of its fills are passive. The model
+      assumes order arrival intensity decaying exponentially in the distance from
+      the mid, and `RandomAgent` crosses at a fixed probability whatever the
+      distance, so the spread it computes is optimal for a different market.
 - [x] Gymnasium RL environment
 - [x] Self-play RL training (league-style)
 - [x] Synthetic data generator (Hawkes process)
@@ -188,11 +212,10 @@ engine.submit(2, sell_order)  # Symbol 2 (isolated book)
 - [x] FIX protocol gateway. Parser and session layer, 14 tests. The four TCP
       integration tests are skipped and hang if forced, so the transport itself
       is not verified.
-- [ ] Deep RL self-play convergence analysis. The tracker and the Elo table are
-      implemented and tested, but `Tournament` falls back to
-      `_default_simulate`, which draws PnL from a fixed distribution and ignores
-      both agents. So the plumbing works and no convergence result has actually
-      been produced.
+- [ ] Deep RL self-play convergence analysis. The tracker, the Elo table and the
+      tournament all run real matches now, but no convergence result has been
+      produced from trained checkpoints, and none of the numbers above involve a
+      trained policy.
 - [ ] Order book imbalance features for ML
 
 ## License
