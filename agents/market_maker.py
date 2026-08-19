@@ -1,30 +1,54 @@
-"""Market maker agent. Named for Avellaneda-Stoikov; see MarketMakerAgent."""
+"""Avellaneda-Stoikov market maker."""
 
 import math
 
 from .base import BaseAgent
 
+# Prices are fixed-point with four decimals, so one tick is 0.0001 price units
+# and 100.0000 is 100_0000. The AS formulas are in price units and the book is
+# in ticks, so every crossing between the two goes through this.
+TICKS_PER_UNIT = 10000.0
+
 
 class MarketMakerAgent(BaseAgent):
-    """Market maker quoting near the touch, with inventory skew and unwinding.
+    """Avellaneda-Stoikov market maker.
 
-    Quotes are placed at or just inside the best bid and ask, skewed by a
-    tick-based function of inventory, with an aggressive unwind once inventory
-    passes a threshold. PnL comes from buying passively at the bid and selling
-    higher.
+    Quotes are placed at the reservation price plus and minus half the optimal
+    spread:
 
-    This is NOT the Avellaneda-Stoikov model, despite the class name and the
-    parameters. The AS reservation price and optimal spread are computed in
-    `on_market_data` and deliberately not used, because at these parameter
-    values and this tick size they produce a half-spread of ~6454 ticks and an
-    inventory skew below one tick. See the note there. Treat gamma, sigma, k and
-    dt as inert until they are recalibrated.
+        r     = mid - q*gamma*sigma^2*tau
+        delta = gamma*sigma^2*tau + (2/gamma)*ln(1 + gamma/k)
+
+    with an aggressive unwind once inventory passes ``max_inventory``, which the
+    model itself does not provide and which exists because the skew goes to zero
+    as tau does.
+
+    The defaults are calibrated for this simulator's price scale, which matters
+    more than it sounds. The formulas are in price units, one tick is 0.0001,
+    and the book spread is one tick in about 98% of steps. Measured from a
+    5000-step run against three RandomAgents:
+
+        sigma  0.00024   the per-step stdev of the mid, measured at 0.000242
+        gamma  230       set so the skew reaches ~2 ticks at q = max_inventory
+                         while tau is still near 1
+        k      23000     set so delta comes out near one tick, which is what
+                         puts r +/- delta/2 on both sides of a one-tick book
+        dt     0.0001    1/10000, so tau runs from 1 down to dt over the default
+                         10000-step horizon rather than hitting the floor early
+
+    Getting these wrong does not fail loudly, it just stops the agent trading.
+    An earlier version of this class shipped with gamma=0.1, sigma=0.002, k=1.5,
+    which are reasonable for a stock quoted in dollars and give a half-spread of
+    6454 ticks here, so no quote could ever have filled, and a skew of 0.0003
+    ticks, which rounds to nothing at all. ``TestQuoteScale`` in
+    ``test_market_maker.py`` pins the half-spread and the skew to a tick range so
+    a future change of price scale fails a test instead of going quiet.
 
     Parameters:
         gamma: Risk aversion coefficient (higher = tighter inventory control).
-        sigma: Estimated volatility of the asset (in price units, float).
-        k: Order arrival intensity parameter.
-        dt: Time step as a fraction of total trading horizon.
+        sigma: Per-step volatility of the mid, in price units.
+        k: Order arrival intensity decay, in inverse price units.
+        dt: Time step as a fraction of the total trading horizon.
         quantity: Order size per side.
         max_inventory: Inventory threshold for aggressive unwinding.
         edge_ticks: Minimum profit (in ticks) required to unwind inventory.
@@ -33,10 +57,10 @@ class MarketMakerAgent(BaseAgent):
     def __init__(
         self,
         agent_id: int,
-        gamma: float = 0.1,
-        sigma: float = 0.002,
-        k: float = 1.5,
-        dt: float = 0.005,
+        gamma: float = 230.0,
+        sigma: float = 0.00024,
+        k: float = 23000.0,
+        dt: float = 0.0001,
         quantity: int = 5,
         max_inventory: int = 15,
         edge_ticks: int = 2,
@@ -108,9 +132,9 @@ class MarketMakerAgent(BaseAgent):
         Each step:
           1. Cancel previous outstanding orders.
           2. Read current book state.
-          3. Compute the AS quantities, which are currently unused.
-          4. Place bid quote (passive liquidity provision).
-          5. Place ask quote (passive) and/or aggressive unwind.
+          3. Compute the reservation price and the optimal spread.
+          4. Place bid at r - delta/2.
+          5. Place ask at r + delta/2, and/or aggressive unwind.
         """
         import exchange_simulator as ex
 
@@ -147,60 +171,48 @@ class MarketMakerAgent(BaseAgent):
                 self._outstanding_order_ids.append(o.id)
             return orders
 
-        # Midprice in fixed-point and float
-        mid_fixed = (best_bid + best_ask) // 2
-        mid = mid_fixed / 10000.0
-        spread = best_ask - best_bid
+        # Midprice in price units. Not integer-divided: the book spread here is
+        # one tick almost all of the time, so (bb + ba) // 2 would round the mid
+        # down onto the best bid and cost half a tick. At a half-tick
+        # half-spread that is the difference between quoting at the touch and
+        # quoting behind it.
+        mid = (best_bid + best_ask) / 2.0 / TICKS_PER_UNIT
 
         self._mid_history.append(mid)
 
-        # --- Step 3: Avellaneda-Stoikov parameters (not wired in) ---
+        # --- Step 3: Avellaneda-Stoikov reservation price and optimal spread ---
         q = self.inventory
         tau = max(self.dt, 1.0 - self._step * self.dt)
 
-        # NOTE: the two AS quantities below are computed but not used to place the
-        # quotes. They are kept because they are the model this agent is named
-        # for, and because the reason they are unused is worth recording rather
-        # than deleting.
-        #
-        # At the defaults (gamma=0.1, sigma=0.002, k=1.5) and this tick size they
-        # are not usable as written:
-        #
-        #   delta = gamma*sigma^2*tau + (2/gamma)*ln(1 + gamma/k)
-        #         = 4e-7 + 1.2908, so the second term swamps the first and delta
-        #           is ~1.29 price units whatever tau is. Half of that is 6454
-        #           ticks, against a book spread of a few ticks, so quotes placed
-        #           at r +/- delta/2 would never fill.
-        #
-        #   r - mid = -q*gamma*sigma^2*tau, which is 0.01 ticks at q=5, so the
-        #           inventory skew rounds away to nothing.
-        #
-        # Making this a real AS agent needs gamma, sigma and k recalibrated for
-        # this price scale, not a rewrite of the quoting below. Until then the
-        # quoting is the tick-based heuristic in steps 4 and 5, and the class
-        # docstring says so.
-        r = mid - q * self.gamma * (self.sigma ** 2) * tau  # noqa: F841
-        delta = (  # noqa: F841
+        # Reservation price: the mid shifted against inventory. Long inventory
+        # pushes it down, so the bid retreats and the ask comes in.
+        r = mid - q * self.gamma * (self.sigma ** 2) * tau
+
+        # Optimal spread. The second term dominates and is what sets the width;
+        # see the class docstring for how gamma, sigma and k were calibrated to
+        # make it land near one tick on this price scale.
+        delta = (
             self.gamma * (self.sigma ** 2) * tau
             + (2.0 / self.gamma) * math.log(1.0 + self.gamma / self.k)
         )
+        half = 0.5 * delta
 
-        # --- Step 4: Place bid (passive buy) ---
-        # Quote at or slightly above best bid to be first in queue
-        bid_price = best_bid
-        if spread > 2:
-            bid_price = best_bid + 1
-
-        # Tick-based inventory skew: when long, lower bid to discourage buying
-        if q > 0:
-            skew_down = min(q // 5, spread // 3)  # reduce aggressiveness
-            bid_price -= skew_down
-        elif q < 0:
-            # When short, be more aggressive on bid to accumulate
-            skew_up = min(-q // 5, spread // 3)
-            bid_price += skew_up
-
+        # --- Step 4: Place bid at the AS quote ---
+        # Round the bid down and the ask up, rather than to nearest. Two
+        # reasons. It is the conservative direction for a quote on each side,
+        # and it guarantees the two land on different ticks: delta is a little
+        # under one tick here, so rounding both to nearest can put the bid and
+        # the ask on the same price, which is not a quote.
+        bid_price = math.floor((r - half) * TICKS_PER_UNIT)
         bid_price = max(bid_price, 100)
+
+        # No clamp back inside the touch. When inventory is large enough that
+        # the skew exceeds a tick, the model is asking to cross, and a limit
+        # order through the touch just fills at the touch. That is the model
+        # unwinding, and neutralizing it here would compute a skew and then
+        # discard it, which is what this agent used to do with the whole
+        # formula. Note that a sub-tick skew cannot move an integer price at
+        # all, so the skew only starts to bite around q = 8.
 
         # Only place bid if inventory isn't too large
         if q < self.max_inventory:
@@ -211,11 +223,8 @@ class MarketMakerAgent(BaseAgent):
             orders.append(bid_order)
             self._outstanding_order_ids.append(bid_order.id)
 
-        # --- Step 5: Place ask (passive + aggressive unwind) ---
-        # Always place a passive ask at or near best_ask
-        ask_price = best_ask
-        if spread > 2:
-            ask_price = best_ask - 1
+        # --- Step 5: Place ask at the AS quote, plus aggressive unwind ---
+        ask_price = math.ceil((r + half) * TICKS_PER_UNIT)
 
         ask_order = self.make_order(
             ex.Side.Sell, ask_price, self.quantity,

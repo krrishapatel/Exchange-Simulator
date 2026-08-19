@@ -33,7 +33,7 @@ All operations well under the 1μs target.
 
 - **C++ Matching Engine**: Price-time priority order book with IOC/FOK/iceberg/stop/pegged orders, opening/closing auctions, zero-allocation memory pool
 - **Python Bindings**: pybind11 wrapper exposing the full engine API to Python
-- **Agent Framework**: BaseAgent interface, RandomAgent, MarketMaker (quotes at the touch with inventory skew)
+- **Agent Framework**: BaseAgent interface, RandomAgent, Avellaneda-Stoikov MarketMaker
 - **RL Environment**: Gymnasium-compliant env for training trading agents with PPO/SAC
 - **Synthetic Data**: Hawkes process order flow with pre-built scenarios (calm, volatile, flash crash)
 - **Live Dashboard**: WebSocket server + React frontend with price chart, order book, trade feed, agent PnL
@@ -74,7 +74,7 @@ exchange-simulator/
 ├── agents/
 │   ├── base.py                    # BaseAgent interface
 │   ├── random_agent.py            # Noise trader
-│   └── market_maker.py            # Market maker, quotes at the touch
+│   └── market_maker.py            # Avellaneda-Stoikov market maker
 ├── rl/
 │   ├── trading_env.py             # Gymnasium environment
 │   └── train_ppo.py               # PPO training script
@@ -108,7 +108,7 @@ exchange-simulator/
 | Agent | Strategy |
 |-------|----------|
 | RandomAgent | Uniform random orders around mid (noise) |
-| MarketMakerAgent | Quotes at or inside the touch, tick-based inventory skew, aggressive unwind |
+| MarketMakerAgent | Avellaneda-Stoikov quoting, inventory skew, aggressive unwind |
 | RL Agent | PPO-trained via Gymnasium environment |
 
 ## Benchmarks
@@ -168,11 +168,15 @@ engine.submit(2, sell_order)  # Symbol 2 (isolated book)
 - [x] Auction phases (opening/closing uncross)
 - [x] Python bindings (pybind11)
 - [x] Agent framework (classical strategies)
-- [x] Market maker (quotes at the touch, inventory skew, unwind)
-- [ ] Avellaneda-Stoikov quoting. The formulas are in `market_maker.py` but are
-      not wired into the quotes: at the default gamma, sigma and k the optimal
-      half-spread comes out around 6454 ticks, so the quotes would never fill.
-      Needs those three recalibrated for this price scale.
+- [x] Avellaneda-Stoikov market maker. Quotes at the reservation price plus and
+      minus half the optimal spread, with an aggressive unwind past
+      `max_inventory`. gamma, sigma and k are calibrated to this price scale from
+      measured mid volatility and book spread, since the formulas are in price
+      units and the book is in ticks. Against the previous tick heuristic over 10
+      seeds it takes 24.7 fills per run instead of 4.9, sells in 10/10 runs
+      instead of 0/10, and ends flatter in 9/10. Mark-to-market PnL is better in
+      6/10, which is noise, and still negative: it is quoting into uninformed
+      flow with no queue priority, so this is not a profitable strategy.
 - [x] Gymnasium RL environment
 - [x] Self-play RL training (league-style)
 - [x] Synthetic data generator (Hawkes process)

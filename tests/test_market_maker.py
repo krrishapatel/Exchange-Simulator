@@ -1,8 +1,11 @@
 """Tests for the market maker agent.
 
-These cover the quoting that is actually in use: two-sided quotes at the touch,
-tick-based inventory skew, and the unwind. The Avellaneda-Stoikov formulas in
-`market_maker.py` are not wired into the quotes, so nothing here tests them.
+These cover the Avellaneda-Stoikov quoting, the inventory skew and the unwind.
+
+`TestQuoteScale` is the one to keep if these ever get trimmed. The AS formulas
+work in price units and the book is in integer ticks, so a wrong parameter does
+not raise, it just puts the quotes thousands of ticks away or makes the skew
+round to zero. Those tests pin both to a tick range so that fails loudly.
 """
 
 import sys
@@ -13,6 +16,31 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import exchange_simulator as ex
 from agents import MarketMakerAgent, RandomAgent
 from simulation import SimulationLoop
+
+
+def _order(oid, side, price, qty=10):
+    o = ex.Order()
+    o.id = oid
+    o.side = side
+    o.price = price
+    o.quantity = qty
+    o.type = ex.OrderType.Limit
+    o.tif = ex.TimeInForce.GTC
+    o.timestamp = 0
+    o.filled_quantity = 0
+    o.stop_price = 0
+    o.peg_offset = 0
+    o.visible_quantity = 0
+    o.hidden_quantity = 0
+    return o
+
+
+def _one_tick_book():
+    """A book one tick wide, which is what the simulator produces ~98% of steps."""
+    engine = ex.MatchingEngine()
+    engine.submit(_order(99001, ex.Side.Buy, 100_0000))
+    engine.submit(_order(99002, ex.Side.Sell, 100_0001))
+    return engine
 
 
 class TestMarketMakerBasics:
@@ -286,3 +314,73 @@ class TestMarketMakerIntegration:
 
         assert results["steps"] == 10000
         assert results["fills"] > 0
+
+
+class TestQuoteScale:
+    """The AS parameters have to match the price scale, and nothing else checks it.
+
+    gamma, sigma and k are in price units. The book is in integer ticks. Get them
+    wrong and the agent still runs, it just quotes somewhere unreachable or
+    computes a skew too small to move an integer price. Both failures are silent,
+    so they get pinned here in ticks.
+    """
+
+    def _quotes(self, inventory=0, **kwargs):
+        engine = _one_tick_book()
+        mm = MarketMakerAgent(agent_id=0, **kwargs)
+        mm.inventory = inventory
+        orders = mm.on_market_data(engine, timestamp=1000)
+        bids = [o.price for o in orders if o.side == ex.Side.Buy]
+        asks = [o.price for o in orders if o.side == ex.Side.Sell]
+        return bids, asks
+
+    def test_half_spread_is_a_few_ticks(self):
+        """Flat inventory quotes both sides within a few ticks of the mid."""
+        bids, asks = self._quotes()
+        assert bids and asks
+        # Mid of a one-tick book at 100_0000/100_0001.
+        assert 0 < 100_0000.5 - bids[0] <= 3, f"bid {bids[0]} too far from mid"
+        assert 0 < asks[0] - 100_0000.5 <= 3, f"ask {asks[0]} too far from mid"
+
+    def test_bid_and_ask_are_different_ticks(self):
+        """Sub-tick half-spread must not collapse both quotes onto one price."""
+        bids, asks = self._quotes()
+        assert bids[0] < asks[0]
+
+    def test_skew_moves_the_quote_by_at_least_a_tick(self):
+        """The regression guard: a skew that rounds to zero is not a skew.
+
+        The shipped defaults used to give a skew of 0.0003 ticks, which cannot
+        move an integer price, so inventory had no effect on the quotes at all.
+        """
+        flat_bids, _ = self._quotes(inventory=0)
+        long_bids, _ = self._quotes(inventory=10)
+        assert long_bids and flat_bids
+        assert flat_bids[0] - long_bids[0] >= 1, (
+            f"skew moved the bid {flat_bids[0] - long_bids[0]} ticks, "
+            "so inventory is not reaching the quotes"
+        )
+
+    def test_skew_stays_bounded_near_max_inventory(self):
+        """Skew grows with inventory but stays in single-digit ticks."""
+        flat_bids, _ = self._quotes(inventory=0)
+        heavy_bids, _ = self._quotes(inventory=14)
+        moved = flat_bids[0] - heavy_bids[0]
+        assert 1 <= moved <= 6, f"skew of {moved} ticks at q=14 is off scale"
+
+    def test_skew_is_signed(self):
+        """Short inventory lifts the bid, long inventory drops it."""
+        short_bids, _ = self._quotes(inventory=-10)
+        flat_bids, _ = self._quotes(inventory=0)
+        long_bids, _ = self._quotes(inventory=10)
+        assert long_bids[0] < flat_bids[0] < short_bids[0]
+
+    def test_dollar_scale_parameters_are_visibly_wrong(self):
+        """Documents the failure this class exists to catch.
+
+        gamma=0.1, sigma=0.002, k=1.5 are reasonable for a stock quoted in
+        dollars and were the shipped defaults. Here they put the quote hundreds
+        of ticks off the book, where it can never fill.
+        """
+        bids, _ = self._quotes(gamma=0.1, sigma=0.002, k=1.5)
+        assert 100_0000.5 - bids[0] > 100
