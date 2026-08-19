@@ -23,25 +23,45 @@ class MarketMakerAgent(BaseAgent):
     model itself does not provide and which exists because the skew goes to zero
     as tau does.
 
-    This is a faithful implementation of the model, not the best quoter in this
-    repo. Over 10 seeds it loses to simply resting at the touch, on PnL in 10 out
-    of 10 of them. The model prices a quote against an order arrival intensity
-    that decays exponentially in the distance from the mid, and RandomAgent
-    crosses at a fixed probability regardless of distance, so the spread this
-    computes is optimal for a market that is not the one it is quoting into.
-
     The defaults are calibrated for this simulator's price scale, which matters
-    more than it sounds. The formulas are in price units, one tick is 0.0001,
-    and the book spread is one tick in about 99% of steps. Measured from a
-    5000-step run against three RandomAgents:
+    more than it sounds. The formulas are in price units and one tick is 0.0001.
+    Measured over 10 seeds of 3000 steps against three RandomAgents:
 
-        sigma  0.00024   the per-step stdev of the mid, measured at 0.000234
-        gamma  230       set so the skew reaches ~2 ticks at q = max_inventory
+        per-step stdev of the mid   0.483 ticks, so 0.0000483 in price units
+        mid moves on               21.0% of steps
+        mean book spread            2.03 ticks
+        quantity at the touch      20.8 units across 34 price levels
+
+    From those:
+
+        sigma  0.000048  the measured per-step stdev of the mid
+        gamma  5700      set so the skew reaches ~2 ticks at q = max_inventory
                          while tau is still near 1
-        k      23000     set so delta comes out near one tick, which is what
-                         puts r +/- delta/2 on both sides of a one-tick book
+        k      8100      set so delta comes out near two ticks, which is the mean
+                         book spread, so r +/- delta/2 lands at the touch
         dt     0.0001    1/10000, so tau runs from 1 down to dt over the default
                          10000-step horizon rather than hitting the floor early
+
+    These replace two earlier sets, both fitted to a market that did not work.
+    RandomAgent never cancelled its orders and rested them 100x too far out, so
+    the mid took 13 distinct values in 3000 steps and this agent got 3 fills.
+    Measured volatility there was 0.000234, which was 13 jumps averaged over 2987
+    frozen steps. Fixing only the cancellation gave a book whose per-step
+    volatility was 3x its own spread, where no quoter can profit. See the
+    RandomAgent docstring for the numbers.
+
+    Against a naive quoter that just rests at the touch on both sides and dumps
+    inventory past a limit, over 10 seeds of 3000 steps:
+
+        agent                  equity        fills  passive  mean|inv|  max|inv|
+        Avellaneda-Stoikov  394.6 +/- 161     222     89%       3.3       13.9
+        touch quoter        388.7 +/- 152     241     91%       8.2       18.8
+
+    So the model does not earn more. It earns the same and carries 2.5x less
+    inventory, winning on equity in 4 of 10 seeds. That is the honest reading and
+    it is what the model is for: the skew is a risk control, not an alpha source,
+    and against uninformed flow there is no adverse selection for it to dodge.
+    Expect the gap to open up if the noise traders are ever given a direction.
 
     Getting these wrong does not fail loudly, it just stops the agent trading.
     An earlier version of this class shipped with gamma=0.1, sigma=0.002, k=1.5,
@@ -64,9 +84,9 @@ class MarketMakerAgent(BaseAgent):
     def __init__(
         self,
         agent_id: int,
-        gamma: float = 230.0,
-        sigma: float = 0.00024,
-        k: float = 23000.0,
+        gamma: float = 5700.0,
+        sigma: float = 0.000048,
+        k: float = 8100.0,
         dt: float = 0.0001,
         quantity: int = 5,
         max_inventory: int = 15,

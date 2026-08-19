@@ -6,6 +6,7 @@
 #include <map>
 #include <unordered_map>
 #include <list>
+#include <vector>
 
 namespace exsim {
 
@@ -25,6 +26,15 @@ struct PriceLevel {
     explicit PriceLevel(Price p) : price(p), total_quantity(0), order_count(0) {}
 };
 
+// One price level, flattened for reading. l2_bids/l2_asks hand these out so a
+// caller can see the quantity resting at each price without touching the level's
+// order list or the maps.
+struct LevelView {
+    Price price;
+    Quantity total_quantity;
+    size_t order_count;
+};
+
 class OrderBook {
 public:
     OrderBook() = default;
@@ -37,8 +47,16 @@ public:
     [[nodiscard]] PriceLevel* best_bid() noexcept;
     [[nodiscard]] PriceLevel* best_ask() noexcept;
     [[nodiscard]] Price spread() const noexcept;
+
+    // Number of distinct price levels on each side. Not a quantity and not an
+    // order count. A single level holding 10000 shares reports 1.
     [[nodiscard]] size_t bid_depth() const noexcept;
     [[nodiscard]] size_t ask_depth() const noexcept;
+
+    // L2 snapshot: up to max_levels levels from the touch outwards, best first.
+    // Shorter than max_levels when the book is thinner than that.
+    [[nodiscard]] std::vector<LevelView> l2_bids(size_t max_levels) const;
+    [[nodiscard]] std::vector<LevelView> l2_asks(size_t max_levels) const;
 
     // Const iterators for liquidity scanning (FOK pre-check)
     using BidsMap = std::map<Price, PriceLevel, std::greater<Price>>;

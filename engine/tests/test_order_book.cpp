@@ -96,3 +96,65 @@ TEST_F(OrderBookTest, Spread) {
     book.add(make_limit(Side::Sell, 10100, 30));
     EXPECT_EQ(book.spread(), 100);
 }
+
+TEST_F(OrderBookTest, L2SnapshotEmptyBook) {
+    EXPECT_TRUE(book.l2_bids(5).empty());
+    EXPECT_TRUE(book.l2_asks(5).empty());
+}
+
+TEST_F(OrderBookTest, L2BidsAreBestFirst) {
+    book.add(make_limit(Side::Buy, 9900, 10));
+    book.add(make_limit(Side::Buy, 10000, 20));
+    book.add(make_limit(Side::Buy, 9800, 30));
+
+    auto levels = book.l2_bids(5);
+    ASSERT_EQ(levels.size(), 3u);
+    EXPECT_EQ(levels[0].price, 10000);
+    EXPECT_EQ(levels[1].price, 9900);
+    EXPECT_EQ(levels[2].price, 9800);
+}
+
+TEST_F(OrderBookTest, L2AsksAreBestFirst) {
+    book.add(make_limit(Side::Sell, 10200, 10));
+    book.add(make_limit(Side::Sell, 10100, 20));
+    book.add(make_limit(Side::Sell, 10300, 30));
+
+    auto levels = book.l2_asks(5);
+    ASSERT_EQ(levels.size(), 3u);
+    EXPECT_EQ(levels[0].price, 10100);
+    EXPECT_EQ(levels[1].price, 10200);
+    EXPECT_EQ(levels[2].price, 10300);
+}
+
+TEST_F(OrderBookTest, L2ReportsQuantityNotLevelCount) {
+    // The distinction bid_depth() does not make: one level, lots of size.
+    book.add(make_limit(Side::Buy, 10000, 400));
+    book.add(make_limit(Side::Buy, 10000, 600));
+
+    EXPECT_EQ(book.bid_depth(), 1u);
+    auto levels = book.l2_bids(5);
+    ASSERT_EQ(levels.size(), 1u);
+    EXPECT_EQ(levels[0].total_quantity, 1000);
+    EXPECT_EQ(levels[0].order_count, 2u);
+}
+
+TEST_F(OrderBookTest, L2TruncatesToMaxLevels) {
+    for (Price p = 10000; p > 9000; p -= 100) {
+        book.add(make_limit(Side::Buy, p, 10));
+    }
+    EXPECT_EQ(book.bid_depth(), 10u);
+    EXPECT_EQ(book.l2_bids(3).size(), 3u);
+    EXPECT_EQ(book.l2_bids(0).size(), 0u);
+}
+
+TEST_F(OrderBookTest, L2ReflectsCancels) {
+    auto order = make_limit(Side::Buy, 10000, 50);
+    book.add(order);
+    book.add(make_limit(Side::Buy, 10000, 25));
+    EXPECT_EQ(book.l2_bids(1)[0].total_quantity, 75);
+
+    book.cancel(order.id);
+    ASSERT_EQ(book.l2_bids(1).size(), 1u);
+    EXPECT_EQ(book.l2_bids(1)[0].total_quantity, 25);
+    EXPECT_EQ(book.l2_bids(1)[0].order_count, 1u);
+}

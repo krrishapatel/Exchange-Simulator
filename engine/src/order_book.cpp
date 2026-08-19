@@ -1,6 +1,8 @@
 // engine/src/order_book.cpp
 #include "order_book.hpp"
 
+#include <algorithm>
+
 namespace exsim {
 
 bool OrderBook::add(const Order& order) {
@@ -80,5 +82,30 @@ Price OrderBook::spread() const noexcept {
 
 size_t OrderBook::bid_depth() const noexcept { return bids_.size(); }
 size_t OrderBook::ask_depth() const noexcept { return asks_.size(); }
+
+namespace {
+
+// Both maps are already sorted best-first, so walking from begin() gives the
+// levels in book order.
+template <typename Map>
+std::vector<LevelView> snapshot(const Map& levels, size_t max_levels) {
+    std::vector<LevelView> out;
+    out.reserve(std::min(max_levels, levels.size()));
+    for (const auto& [price, level] : levels) {
+        if (out.size() >= max_levels) break;
+        out.push_back({price, level.total_quantity, level.order_count});
+    }
+    return out;
+}
+
+} // namespace
+
+std::vector<LevelView> OrderBook::l2_bids(size_t max_levels) const {
+    return snapshot(bids_, max_levels);
+}
+
+std::vector<LevelView> OrderBook::l2_asks(size_t max_levels) const {
+    return snapshot(asks_, max_levels);
+}
 
 } // namespace exsim

@@ -88,10 +88,17 @@ class SelfPlayEnv(gym.Env):
     between episodes rather than using a multi-agent API.
 
     Observation space (Box, float32, shape=(11,)):
-        Same as TradingEnv: mid_price, spread, bid/ask depths, inventory, pnl, imbalance.
+        Same layout and normalizers as TradingEnv: mid, spread, real per-level
+        bid and ask quantity, inventory against its limit, marked equity, touch
+        imbalance. See the TradingEnv docstring for what each divisor is and for
+        what these features used to be.
 
     Action space (Discrete(5)):
         Same as TradingEnv: hold, buy_limit_bid, buy_market, sell_limit_ask, sell_market.
+
+    Both players requote each step and both are held to ``max_inventory``. The
+    limits have to be symmetric or the match is decided by which side was allowed
+    to take more risk rather than by which side traded better.
 
     Reward:
         PnL delta relative to opponent's PnL delta (competitive reward)
@@ -102,13 +109,21 @@ class SelfPlayEnv(gym.Env):
 
     _BASE_PRICE = 100_0000  # 100.0000 in fixed-point
 
+    # Same normalizers as TradingEnv, so a policy trained in one env reads the
+    # same numbers in the other.
+    _MID_SCALE = 10.0
+    _SPREAD_SCALE = 5.0
+    _LEVEL_QTY_SCALE = 20.0
+    _EQUITY_SCALE = 100.0
+
     def __init__(
         self,
         opponent_policies: list[OpponentPolicy] | None = None,
         num_noise_traders: int = 3,
         episode_length: int = 1000,
-        inventory_penalty: float = 0.001,
+        inventory_penalty: float = 0.005,
         order_quantity: int = 1,
+        max_inventory: int = 25,
         competitive_reward_weight: float = 0.5,
         seed: int | None = None,
     ):
@@ -119,8 +134,11 @@ class SelfPlayEnv(gym.Env):
                                a random opponent is used.
             num_noise_traders: Number of background noise traders.
             episode_length: Steps per episode.
-            inventory_penalty: Penalty multiplier on abs(inventory).
+            inventory_penalty: Per-step penalty on abs(inventory), in ticks.
+                Charged to the agent only, since the opponent is frozen and does
+                not learn. See TradingEnv for how the default was set.
             order_quantity: Quantity for each order.
+            max_inventory: Position limit, applied to both players. 0 disables it.
             competitive_reward_weight: Weight for relative PnL vs opponent (0-1).
                                        0 = pure absolute PnL, 1 = pure relative.
             seed: Random seed.
@@ -131,6 +149,7 @@ class SelfPlayEnv(gym.Env):
         self.episode_length = episode_length
         self.inventory_penalty = inventory_penalty
         self.order_quantity = order_quantity
+        self.max_inventory = max_inventory
         self.competitive_reward_weight = competitive_reward_weight
         self._seed = seed
 
@@ -167,6 +186,7 @@ class SelfPlayEnv(gym.Env):
         self._prev_agent_pnl = 0.0
         self._agent_order_id_counter = 900_000_000
         self._my_order_ids: set[int] = set()
+        self._agent_live_order_ids: list[int] = []
 
         # Opponent state
         self._opp_inventory = 0
@@ -174,6 +194,7 @@ class SelfPlayEnv(gym.Env):
         self._prev_opp_pnl = 0.0
         self._opp_order_id_counter = 800_000_000
         self._opp_order_ids: set[int] = set()
+        self._opp_live_order_ids: list[int] = []
 
         # Fill routing
         self._order_to_agent: dict[int, RandomAgent] = {}
@@ -261,6 +282,7 @@ class SelfPlayEnv(gym.Env):
         self._prev_agent_pnl = 0.0
         self._agent_order_id_counter = 900_000_000
         self._my_order_ids = set()
+        self._agent_live_order_ids = []
 
         # Reset opponent state
         self._opp_inventory = 0
@@ -268,6 +290,7 @@ class SelfPlayEnv(gym.Env):
         self._prev_opp_pnl = 0.0
         self._opp_order_id_counter = 800_000_000
         self._opp_order_ids = set()
+        self._opp_live_order_ids = []
 
         # Reset fill routing
         self._order_to_agent = {}
@@ -276,7 +299,7 @@ class SelfPlayEnv(gym.Env):
         self._noise_traders = []
         for i in range(self.num_noise_traders):
             trader_seed = self._rng.randint(0, 2**31)
-            trader = RandomAgent(agent_id=i + 1, tick_range=5, seed=trader_seed)
+            trader = RandomAgent(agent_id=i + 1, seed=trader_seed)
             self._noise_traders.append(trader)
 
         # Warmup: seed the book
@@ -378,13 +401,28 @@ class SelfPlayEnv(gym.Env):
     ) -> None:
         """Execute an action for either the RL agent or opponent.
 
+        Cancels that player's previous quote first, so a resting order lives one
+        step, and drops orders that would breach ``max_inventory``.
+
         Args:
             action: Discrete action (0-4).
             timestamp: Current timestamp.
             is_opponent: If True, execute for opponent.
         """
+        live = self._opp_live_order_ids if is_opponent else self._agent_live_order_ids
+        for order_id in live:
+            self._engine.cancel(order_id)
+        live.clear()
+
         if action == 0:
             return
+
+        inventory = self._opp_inventory if is_opponent else self._agent_inventory
+        if self.max_inventory:
+            if action in (1, 2) and inventory >= self.max_inventory:
+                return
+            if action in (3, 4) and inventory <= -self.max_inventory:
+                return
 
         book = self._engine.book()
         best_bid = book.best_bid_price()
@@ -433,6 +471,8 @@ class SelfPlayEnv(gym.Env):
             self._opp_order_ids.add(order.id)
         else:
             self._my_order_ids.add(order.id)
+        if order.tif == ex.TimeInForce.GTC:
+            live.append(order.id)
 
         fills = self._engine.submit(order)
         self._process_fills(fills)
@@ -511,48 +551,54 @@ class SelfPlayEnv(gym.Env):
     ) -> np.ndarray:
         """Construct observation vector for a given agent's state.
 
+        Both players get the same view of the book and their own position, so a
+        checkpoint frozen as an opponent reads exactly what it was trained on.
+
         Args:
             inventory: Agent's current inventory.
-            pnl: Agent's current PnL.
+            pnl: Agent's current cash.
 
         Returns:
             numpy array of shape (11,).
         """
         book = self._engine.book()
-        best_bid = book.best_bid_price()
-        best_ask = book.best_ask_price()
+        bid_levels = book.l2_bids(3)
+        ask_levels = book.l2_asks(3)
 
-        if best_bid is not None and best_ask is not None:
-            mid_price = (best_bid + best_ask) / 2.0
-            spread = best_ask - best_bid
-        elif best_bid is not None:
-            mid_price = float(best_bid)
+        if bid_levels and ask_levels:
+            mid_price = (bid_levels[0].price + ask_levels[0].price) / 2.0
+            spread = float(ask_levels[0].price - bid_levels[0].price)
+        elif bid_levels:
+            mid_price = float(bid_levels[0].price)
             spread = 0.0
-        elif best_ask is not None:
-            mid_price = float(best_ask)
+        elif ask_levels:
+            mid_price = float(ask_levels[0].price)
             spread = 0.0
         else:
             mid_price = float(self._BASE_PRICE)
             spread = 0.0
 
-        norm_mid = (mid_price - self._BASE_PRICE) / self._BASE_PRICE
-        norm_spread = spread / 1000.0
+        bid_qty = [0.0, 0.0, 0.0]
+        ask_qty = [0.0, 0.0, 0.0]
+        for i, level in enumerate(bid_levels):
+            bid_qty[i] = float(level.total_quantity)
+        for i, level in enumerate(ask_levels):
+            ask_qty[i] = float(level.total_quantity)
 
-        total_bid_depth = book.bid_depth()
-        total_ask_depth = book.ask_depth()
+        norm_mid = (mid_price - self._BASE_PRICE) / self._MID_SCALE
+        norm_spread = spread / self._SPREAD_SCALE
+        norm_bid_qty = [q / self._LEVEL_QTY_SCALE for q in bid_qty]
+        norm_ask_qty = [q / self._LEVEL_QTY_SCALE for q in ask_qty]
 
-        bid_levels = self._distribute_depth(total_bid_depth, 3)
-        ask_levels = self._distribute_depth(total_ask_depth, 3)
+        inv_scale = float(self.max_inventory) if self.max_inventory else 100.0
+        norm_inventory = inventory / inv_scale
 
-        norm_bid_levels = [d / 50.0 for d in bid_levels]
-        norm_ask_levels = [d / 50.0 for d in ask_levels]
+        # Equity, not cash, and marked at the same mid for both players.
+        norm_equity = (pnl + inventory * mid_price) / self._EQUITY_SCALE
 
-        norm_inventory = inventory / 100.0
-        norm_pnl = pnl / 1_000_000.0
-
-        total_depth = total_bid_depth + total_ask_depth
-        if total_depth > 0:
-            imbalance = (total_bid_depth - total_ask_depth) / total_depth
+        touch_total = bid_qty[0] + ask_qty[0]
+        if touch_total > 0:
+            imbalance = (bid_qty[0] - ask_qty[0]) / touch_total
         else:
             imbalance = 0.0
 
@@ -560,28 +606,19 @@ class SelfPlayEnv(gym.Env):
             [
                 norm_mid,
                 norm_spread,
-                norm_bid_levels[0],
-                norm_bid_levels[1],
-                norm_bid_levels[2],
-                norm_ask_levels[0],
-                norm_ask_levels[1],
-                norm_ask_levels[2],
+                norm_bid_qty[0],
+                norm_bid_qty[1],
+                norm_bid_qty[2],
+                norm_ask_qty[0],
+                norm_ask_qty[1],
+                norm_ask_qty[2],
                 norm_inventory,
-                norm_pnl,
+                norm_equity,
                 imbalance,
             ],
             dtype=np.float32,
         )
         return obs
-
-    @staticmethod
-    def _distribute_depth(total: int, levels: int) -> list[float]:
-        """Distribute total depth across simulated levels."""
-        if total == 0:
-            return [0.0] * levels
-        weights = list(range(levels, 0, -1))
-        weight_sum = sum(weights)
-        return [total * w / weight_sum for w in weights]
 
     def _get_info(self) -> dict:
         """Return info dict with agent and opponent stats."""

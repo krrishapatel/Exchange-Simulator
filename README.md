@@ -45,7 +45,7 @@ All operations well under the 1μs target.
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 
-# Run all C++ tests (66 tests)
+# Run all C++ tests (80 tests)
 ctest --test-dir build --output-on-failure
 
 # Run Python tests
@@ -68,7 +68,7 @@ exchange-simulator/
 │   │   ├── order_book.hpp/cpp     # L2/L3 book, price-time priority
 │   │   ├── matching_engine.hpp/cpp # Execution engine + auction phases
 │   │   └── auction.hpp/cpp        # Opening/closing uncross
-│   ├── tests/                     # Google Test suite (66 tests)
+│   ├── tests/                     # Google Test suite (80 tests)
 │   └── bench/                     # Google Benchmark suite
 ├── bindings/                      # pybind11 Python wrapper
 ├── agents/
@@ -107,9 +107,10 @@ exchange-simulator/
 
 | Agent | Strategy |
 |-------|----------|
-| RandomAgent | Uniform random orders around mid, 8% of them crossing (noise) |
+| RandomAgent | Uniform random orders around mid, 8% of them crossing, orders expire after 25 steps |
 | MarketMakerAgent | Avellaneda-Stoikov quoting, inventory skew, aggressive unwind |
-| RL Agent | PPO-trained via Gymnasium environment |
+| RL Agent | PPO via Gymnasium env. Learns two-sided quoting and inventory skew, matches the heuristic |
+| `rl/baselines.py` | Reference policies the trained agent is measured against |
 
 ## Benchmarks
 
@@ -124,16 +125,28 @@ exchange-simulator/
 pip install ".[rl]"
 
 # Basic PPO training
-PYTHONPATH=build/bindings:. python3 rl/train_ppo.py --timesteps 100000
+PYTHONPATH=build/bindings:. python3 -m rl.train_ppo --total-timesteps 1000000
 
 # Self-play training (league-style opponent pool)
-PYTHONPATH=build/bindings:. python3 rl/self_play.py --timesteps 500000 --pool-size 10
+PYTHONPATH=build/bindings:. python3 rl/self_play.py --total-timesteps 500000 --pool-size 10
 
 # Evaluate a trained model
 PYTHONPATH=build/bindings:. python3 rl/evaluate.py --model models/ppo_trader.zip --episodes 100
 ```
 
-Models save to `models/`. TensorBoard logs to `logs/`.
+Models save to `models/`, one row per episode to `logs/ppo_trading/monitor.csv`.
+That file is the learning curve; TensorBoard is optional and skipped if it is not
+installed. Training ends with a comparison against the heuristics in
+`rl/baselines.py` on seeds the agent never trained on, because a reward curve
+going up says nothing about whether the policy is any good. On the default
+settings the curve runs from -678 to about +2 over 1000 episodes and flattens
+after roughly episode 500.
+
+The comparison is the point. `random` loses about 400 ticks an episode, since two
+of the five actions cross the spread; `inventory_aware`, which is a sign test on
+the position, makes about 18; and the trained agent matches it. Judge on
+`equity`, never on `pnl`, which is cash flow and reads as a large loss for
+anything holding stock at the end.
 
 ## Data Replay & Backtesting
 
@@ -189,18 +202,58 @@ engine.submit(2, sell_order)  # Symbol 2 (isolated book)
       `rng.normal(0, 100)`, so `python -m rl.analysis.tournament` printed a
       confident Elo ranking of your checkpoints that ignored the checkpoints. It
       had no tests, which is why nobody noticed.
+- [x] Resting order expiry. `RandomAgent` never cancelled. Three of them add
+      about 16 units of size per step and only ~8% of flow crosses, so the book
+      thickened without bound until the touch was a wall nobody could clear: over
+      3000 steps the touch reached 3258 units and the mid took 13 distinct values,
+      moving on 0.4% of steps. There was no price discovery, and every number
+      measured against that book was an artifact, including the volatility used to
+      calibrate the market maker, which was 13 jumps averaged over 2987 frozen
+      steps. Orders now expire after `order_lifetime` steps. A second defect was
+      hiding behind this one: passive orders rested on a 100-unit grid on a book
+      one unit wide, so clearing a level jumped the mid ~50 units and per-step
+      volatility ran at 3x the spread. Both are fixed, and the resulting market
+      has stationary depth, moves on 21% of steps, and a per-step volatility
+      (0.48 ticks) below its spread (2.03) as a real book does.
 - [x] Avellaneda-Stoikov market maker. Quotes at the reservation price plus and
       minus half the optimal spread, with an aggressive unwind past
-      `max_inventory`. gamma, sigma and k are calibrated to this price scale from
-      the measured per-step mid volatility (0.000234) and book spread (one unit in
-      99% of steps), since the formulas are in price units and the book is in
-      ticks. It is a correct implementation of the model and it is not the best
-      quoter here: over 10 seeds against a plain touch-quoting heuristic it takes
-      9.1 fills per run against 10.7 and returns -69 marked to market against
-      +887, worse in 10 out of 10 seeds. 89% of its fills are passive. The model
-      assumes order arrival intensity decaying exponentially in the distance from
-      the mid, and `RandomAgent` crosses at a fixed probability whatever the
-      distance, so the spread it computes is optimal for a different market.
+      `max_inventory`. gamma, sigma and k are calibrated to this price scale,
+      since the formulas are in price units and the book is in ticks. Over 10
+      seeds of 3000 steps against a plain touch-quoting heuristic it returns
+      394.6 +/- 161 marked to market against 388.7 +/- 152, winning in 4 of 10
+      seeds, while carrying 2.5x less inventory (mean absolute position 3.3
+      against 8.2, peak 13.9 against 18.8). It earns the same money with less
+      risk, which is what the model is for: the skew is a risk control, not an
+      alpha source, and against uninformed flow there is no adverse selection for
+      it to avoid. An earlier version of this entry reported -69 against +887 and
+      a 0-for-10 loss. Those numbers were measured in the frozen market described
+      above and are withdrawn.
+- [x] Order book imbalance features for ML. `OrderBook` gained `l2_bids` and
+      `l2_asks`, returning per-level price, quantity and order count, so the RL
+      observation now carries the real quantity resting at each of the top three
+      levels on each side and a touch imbalance computed from quantity. It used
+      to call `bid_depth()`, which counts price levels rather than quantity, and
+      split that one number across three "levels" on fixed 3:2:1 weights, so
+      levels 1 and 2 held no information the sum did not already have and the
+      imbalance moved with how spread out the book was rather than with pressure.
+- [x] Deep RL self-play convergence analysis. PPO on `TradingEnv` for 1M steps
+      converges, and it converges to the hand-written heuristic rather than past
+      it. Over 400 held-out seeds the trained policy returns 17.5 +/- 0.4 against
+      17.9 +/- 0.5 for a six-line inventory-flattening rule: a paired difference
+      of -0.1 +/- 0.4, ahead in exactly 200 of 400 seeds. It gets there on its
+      own, which is the interesting part. Sweeping only the position feature flips
+      its action exactly at zero, from `buy_limit` when flat or short one to
+      `sell_limit` at plus one and above, escalating to `buy_market` past three
+      short, and in a live episode it quotes the flattening side on 94.3% of the
+      steps where it trades while holding a position. That is the shape of the
+      Avellaneda-Stoikov skew plus threshold unwind, learned from the reward
+      alone. It never crosses the spread unprompted. Reproduce with
+      `python -m rl.train_ppo`, and see `rl/baselines.py` for the reference
+      policies. Two caveats: the inventory penalty is doing real work, since at
+      the old default of 0.005 the same recipe learned a policy holding 7.7 units
+      that did not beat the heuristic (-3.0 +/- 5.5 over 400 seeds); and this is
+      single-agent training, so league-style self-play convergence is still
+      unmeasured.
 - [x] Gymnasium RL environment
 - [x] Self-play RL training (league-style)
 - [x] Synthetic data generator (Hawkes process)
@@ -212,11 +265,10 @@ engine.submit(2, sell_order)  # Symbol 2 (isolated book)
 - [x] FIX protocol gateway. Parser and session layer, 14 tests. The four TCP
       integration tests are skipped and hang if forced, so the transport itself
       is not verified.
-- [ ] Deep RL self-play convergence analysis. The tracker, the Elo table and the
-      tournament all run real matches now, but no convergence result has been
-      produced from trained checkpoints, and none of the numbers above involve a
-      trained policy.
-- [ ] Order book imbalance features for ML
+- [ ] League-style self-play convergence. `SelfPlayEnv` runs real matches and
+      both players now requote and share one position limit, but the convergence
+      result above is single-agent. No Elo curve has been produced from a league
+      of trained checkpoints playing each other.
 
 ## License
 

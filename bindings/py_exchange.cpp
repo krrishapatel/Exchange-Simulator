@@ -4,6 +4,8 @@
 #include "matching_engine.hpp"
 #include "multi_asset_engine.hpp"
 
+#include <string>
+
 namespace py = pybind11;
 using namespace exsim;
 
@@ -64,10 +66,27 @@ PYBIND11_MODULE(exchange_simulator, m) {
         .def_readonly("aggressor_side", &Fill::aggressor_side)
         .def_readonly("timestamp", &Fill::timestamp);
 
+    // One price level of an L2 snapshot
+    py::class_<LevelView>(m, "LevelView")
+        .def_readonly("price", &LevelView::price)
+        .def_readonly("total_quantity", &LevelView::total_quantity)
+        .def_readonly("order_count", &LevelView::order_count)
+        .def("__repr__", [](const LevelView& l) {
+            return "<LevelView price=" + std::to_string(l.price) +
+                   " qty=" + std::to_string(l.total_quantity) +
+                   " orders=" + std::to_string(l.order_count) + ">";
+        });
+
     // OrderBook (read-only access via MatchingEngine::book())
     py::class_<OrderBook>(m, "OrderBook")
-        .def("bid_depth", &OrderBook::bid_depth)
-        .def("ask_depth", &OrderBook::ask_depth)
+        .def("bid_depth", &OrderBook::bid_depth,
+             "Number of distinct bid price levels. Not a quantity.")
+        .def("ask_depth", &OrderBook::ask_depth,
+             "Number of distinct ask price levels. Not a quantity.")
+        .def("l2_bids", &OrderBook::l2_bids, py::arg("max_levels") = 5,
+             "Bid levels from the touch outwards, best first.")
+        .def("l2_asks", &OrderBook::l2_asks, py::arg("max_levels") = 5,
+             "Ask levels from the touch outwards, best first.")
         .def("spread", &OrderBook::spread)
         .def("best_bid_price", [](const OrderBook& book) -> py::object {
             auto* level = book.best_bid();
