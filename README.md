@@ -266,9 +266,21 @@ engine.submit(2, sell_order)  # Symbol 2 (isolated book)
 - [x] Live dashboard (WebSocket + React)
 - [x] Latency histogram panel
 - [x] Multi-asset matching engine
-- [x] FIX protocol gateway. Parser and session layer, 14 tests. The four TCP
-      integration tests are skipped and hang if forced, so the transport itself
-      is not verified.
+- [x] FIX protocol gateway, transport included. 20 tests, all running: parser,
+      session layer, and six that drive a real TCP connection on an ephemeral
+      port. Un-skipping those found three defects. `stop()` awaited
+      `Server.wait_closed()` before closing client sockets, and since Python 3.12
+      that call waits for the connection handlers, so shutting down with a client
+      still attached hung forever; that is what the skip was hiding, and it also
+      swallowed the assertion failure underneath. Every test then assumed one
+      `read()` returned exactly the messages it expected, which is not something
+      TCP promises, so an order that produced both a New ack and a Fill looked
+      like a missing fill whenever the two landed in separate segments; they now
+      read until a message count is met. Last, fills were only ever reported to
+      the incoming order, so a client whose resting order traded was never told,
+      which FIX does not allow. Both sides are reported now, each with its own
+      terms, and the resting side is reached through a gateway-level owner map
+      because it usually belongs to a different session.
 - [x] League-style self-play convergence, and it does not converge to a skill
       ladder. Training PPO in self-play for 300k steps, snapshotting every 50k,
       gives seven checkpoints; running them plus a random anchor through an

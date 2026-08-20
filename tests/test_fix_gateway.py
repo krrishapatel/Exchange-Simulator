@@ -40,6 +40,7 @@ from gateway.fix_parser import (
     TAG_LAST_PX,
     TAG_LAST_QTY,
     TAG_CUM_QTY,
+    TAG_LEAVES_QTY,
     MSG_TYPE_LOGON,
     MSG_TYPE_LOGOUT,
     MSG_TYPE_NEW_ORDER_SINGLE,
@@ -58,9 +59,11 @@ from gateway.fix_gateway import (
     FIX_TIF_DAY,
     EXEC_TYPE_NEW,
     EXEC_TYPE_FILL,
+    EXEC_TYPE_PARTIAL_FILL,
     EXEC_TYPE_CANCELED,
     ORD_STATUS_NEW,
     ORD_STATUS_FILLED,
+    ORD_STATUS_PARTIALLY_FILLED,
     ORD_STATUS_CANCELED,
 )
 
@@ -333,11 +336,48 @@ class TestFixSession:
 
 
 # --- Gateway Integration Tests ---
-# These tests require a live TCP connection and can be slow in CI.
-# Run manually with: pytest tests/test_fix_gateway.py::TestFixGateway -v --timeout=30
+# These run against a live TCP connection on an ephemeral port, so they need no
+# fixed port and no fixed timing.
 
 
-@pytest.mark.skip(reason="TCP integration tests require manual run (heartbeat timing)")
+async def read_messages(reader, count=1, timeout=2.0, buffer=b""):
+    """Read from the socket until `count` complete FIX messages have arrived.
+
+    TCP preserves no message boundaries, so one read() can return half a
+    message, one message, or several. Waiting on a message count instead of a
+    read count is what makes these tests deterministic: an order that produces
+    both a New ack and a Fill used to look like a missing fill purely because
+    the two reports landed in different segments.
+
+    Returns (messages, leftover) and the leftover must be threaded into the next
+    call, or a message that arrived early is silently dropped.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    messages = []
+
+    while True:
+        while True:
+            raw, buffer = extract_message(buffer)
+            if raw is None:
+                break
+            messages.append(parse_message(raw))
+        if len(messages) >= count:
+            return messages, buffer
+
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise AssertionError(
+                f"expected {count} FIX message(s), got {len(messages)}: {messages}"
+            )
+        data = await asyncio.wait_for(reader.read(4096), timeout=remaining)
+        if not data:
+            raise AssertionError(
+                f"gateway closed the connection after {len(messages)} message(s)"
+            )
+        buffer += data
+
+
 class TestFixGateway:
     """Integration tests for the FIX gateway with the matching engine."""
 
@@ -375,10 +415,7 @@ class TestFixGateway:
             await writer.drain()
 
             # Wait for logon ack
-            data = await asyncio.wait_for(reader.read(4096), timeout=2.0)
-            ack_msg, _ = extract_message(data)
-            assert ack_msg is not None
-            ack = parse_message(ack_msg)
+            (ack,), buf = await read_messages(reader)
             assert ack[TAG_MSG_TYPE] == MSG_TYPE_LOGON
 
             # Send NewOrderSingle (limit buy)
@@ -400,10 +437,7 @@ class TestFixGateway:
             await writer.drain()
 
             # Wait for execution report (New ack)
-            data = await asyncio.wait_for(reader.read(4096), timeout=2.0)
-            er_msg, _ = extract_message(data)
-            assert er_msg is not None
-            er = parse_message(er_msg)
+            (er,), buf = await read_messages(reader, buffer=buf)
             assert er[TAG_MSG_TYPE] == MSG_TYPE_EXECUTION_REPORT
             assert er[TAG_EXEC_TYPE] == EXEC_TYPE_NEW
             assert er[TAG_ORD_STATUS] == ORD_STATUS_NEW
@@ -435,7 +469,7 @@ class TestFixGateway:
             })
             writer.write(logon.encode("ascii"))
             await writer.drain()
-            data = await asyncio.wait_for(reader.read(4096), timeout=2.0)
+            _, buf = await read_messages(reader)
 
             # Submit a resting sell order (limit)
             sell = build_message({
@@ -456,7 +490,7 @@ class TestFixGateway:
             await writer.drain()
 
             # Read sell ack
-            data = await asyncio.wait_for(reader.read(4096), timeout=2.0)
+            _, buf = await read_messages(reader, buffer=buf)
 
             # Submit matching buy order
             buy = build_message({
@@ -476,31 +510,178 @@ class TestFixGateway:
             writer.write(buy.encode("ascii"))
             await writer.drain()
 
-            # Read execution reports - expect New + Fill
-            data = await asyncio.wait_for(reader.read(8192), timeout=2.0)
-            buffer = data
-            messages = []
-            while True:
-                msg, buffer = extract_message(buffer)
-                if msg is None:
-                    break
-                messages.append(parse_message(msg))
+            # A trade has two sides, so expect three reports: the New ack for the
+            # incoming buy, its fill, and a fill for the resting sell it hit.
+            messages, buf = await read_messages(reader, count=3, buffer=buf)
 
-            # Find the fill report for buy1
-            fill_reports = [
-                m for m in messages
-                if m.get(TAG_EXEC_TYPE) == EXEC_TYPE_FILL
-                and m.get(TAG_CL_ORD_ID) == "buy1"
-            ]
-            assert len(fill_reports) == 1
-            fill = fill_reports[0]
-            assert fill[TAG_ORD_STATUS] == ORD_STATUS_FILLED
-            assert fill[TAG_LAST_QTY] == "25"
-            assert fill[TAG_CUM_QTY] == "25"
-            assert float(fill[TAG_LAST_PX]) == pytest.approx(100.0, abs=0.001)
+            for cl_ord_id in ("buy1", "sell1"):
+                fill_reports = [
+                    m for m in messages
+                    if m.get(TAG_EXEC_TYPE) == EXEC_TYPE_FILL
+                    and m.get(TAG_CL_ORD_ID) == cl_ord_id
+                ]
+                assert len(fill_reports) == 1, cl_ord_id
+                fill = fill_reports[0]
+                assert fill[TAG_ORD_STATUS] == ORD_STATUS_FILLED
+                assert fill[TAG_LAST_QTY] == "25"
+                assert fill[TAG_CUM_QTY] == "25"
+                assert float(fill[TAG_LAST_PX]) == pytest.approx(100.0, abs=0.001)
+
+            # Each side keeps its own side tag, not the incoming order's.
+            by_id = {m[TAG_CL_ORD_ID]: m for m in messages
+                     if m.get(TAG_EXEC_TYPE) == EXEC_TYPE_FILL}
+            assert by_id["buy1"][TAG_SIDE] == FIX_SIDE_BUY
+            assert by_id["sell1"][TAG_SIDE] == FIX_SIDE_SELL
 
             writer.close()
             await writer.wait_closed()
+        finally:
+            await gateway.stop()
+
+    @pytest.mark.asyncio
+    async def test_fill_reaches_the_resting_order_on_another_session(self, gateway):
+        """The resting side of a trade is told about it, on its own connection.
+
+        The order books are shared, so the two sides of a fill are usually two
+        different clients. This is the case a per-connection order map cannot
+        serve: the incoming order's session has never heard of the resting order.
+        """
+        await gateway.start()
+        port = gateway._server.sockets[0].getsockname()[1]
+
+        async def logon(comp_id):
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            writer.write(build_message({
+                TAG_MSG_TYPE: MSG_TYPE_LOGON,
+                TAG_MSG_SEQ_NUM: "1",
+                TAG_SENDER_COMP_ID: comp_id,
+                TAG_TARGET_COMP_ID: "EXCHANGE",
+                TAG_SENDING_TIME: "20260707-12:00:00.000",
+                TAG_ENCRYPT_METHOD: "0",
+                TAG_HEARTBT_INT: "30",
+            }).encode("ascii"))
+            await writer.drain()
+            _, buf = await read_messages(reader)
+            return reader, writer, buf
+
+        def order(comp_id, seq, cl_ord_id, side, qty):
+            return build_message({
+                TAG_MSG_TYPE: MSG_TYPE_NEW_ORDER_SINGLE,
+                TAG_MSG_SEQ_NUM: str(seq),
+                TAG_SENDER_COMP_ID: comp_id,
+                TAG_TARGET_COMP_ID: "EXCHANGE",
+                TAG_SENDING_TIME: "20260707-12:00:01.000",
+                TAG_CL_ORD_ID: cl_ord_id,
+                TAG_SIDE: side,
+                TAG_ORD_TYPE: FIX_ORD_TYPE_LIMIT,
+                TAG_PRICE: "100.0000",
+                TAG_ORDER_QTY: str(qty),
+                TAG_TIME_IN_FORCE: FIX_TIF_DAY,
+                TAG_SYMBOL: "AAPL",
+            }).encode("ascii")
+
+        try:
+            maker_r, maker_w, maker_buf = await logon("MAKER")
+            taker_r, taker_w, taker_buf = await logon("TAKER")
+
+            # MAKER rests a sell, and reads only its New ack for now.
+            maker_w.write(order("MAKER", 2, "rest1", FIX_SIDE_SELL, 40))
+            await maker_w.drain()
+            (ack,), maker_buf = await read_messages(maker_r, buffer=maker_buf)
+            assert ack[TAG_EXEC_TYPE] == EXEC_TYPE_NEW
+            assert ack[TAG_CL_ORD_ID] == "rest1"
+
+            # TAKER hits part of it from a different session.
+            taker_w.write(order("TAKER", 2, "hit1", FIX_SIDE_BUY, 15))
+            await taker_w.drain()
+            taker_msgs, taker_buf = await read_messages(
+                taker_r, count=2, buffer=taker_buf
+            )
+            taker_fills = [
+                m for m in taker_msgs if m.get(TAG_EXEC_TYPE) == EXEC_TYPE_FILL
+            ]
+            assert len(taker_fills) == 1
+            assert taker_fills[0][TAG_CL_ORD_ID] == "hit1"
+            assert taker_fills[0][TAG_ORD_STATUS] == ORD_STATUS_FILLED
+            assert taker_fills[0][TAG_LAST_QTY] == "15"
+
+            # MAKER hears about it without having sent anything, as a partial:
+            # 15 of its 40 traded, so 25 are still working.
+            (maker_fill,), maker_buf = await read_messages(
+                maker_r, buffer=maker_buf
+            )
+            assert maker_fill[TAG_CL_ORD_ID] == "rest1"
+            assert maker_fill[TAG_EXEC_TYPE] == EXEC_TYPE_PARTIAL_FILL
+            assert maker_fill[TAG_ORD_STATUS] == ORD_STATUS_PARTIALLY_FILLED
+            assert maker_fill[TAG_LAST_QTY] == "15"
+            assert maker_fill[TAG_CUM_QTY] == "15"
+            assert maker_fill[TAG_LEAVES_QTY] == "25"
+            # Its own terms, not the incoming order's.
+            assert maker_fill[TAG_SIDE] == FIX_SIDE_SELL
+            assert maker_fill[TAG_ORDER_QTY] == "40"
+
+            for w in (maker_w, taker_w):
+                w.close()
+                await w.wait_closed()
+        finally:
+            await gateway.stop()
+
+        # Both sessions are gone, so nothing is left pointing at a dead socket.
+        assert gateway._order_owner == {}
+
+    @pytest.mark.asyncio
+    async def test_a_disconnect_deregisters_that_session_s_orders(self, gateway):
+        """One client leaving takes its orders out of the owner map.
+
+        The gateway stays up here, so this is the case `stop()` does not cover:
+        without it the map grows for the life of the process and a later fill
+        tries to report down a socket that is already gone.
+        """
+        await gateway.start()
+        port = gateway._server.sockets[0].getsockname()[1]
+
+        try:
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            writer.write(build_message({
+                TAG_MSG_TYPE: MSG_TYPE_LOGON,
+                TAG_MSG_SEQ_NUM: "1",
+                TAG_SENDER_COMP_ID: "CLIENT1",
+                TAG_TARGET_COMP_ID: "EXCHANGE",
+                TAG_SENDING_TIME: "20260707-12:00:00.000",
+                TAG_ENCRYPT_METHOD: "0",
+                TAG_HEARTBT_INT: "30",
+            }).encode("ascii"))
+            await writer.drain()
+            _, buf = await read_messages(reader)
+
+            writer.write(build_message({
+                TAG_MSG_TYPE: MSG_TYPE_NEW_ORDER_SINGLE,
+                TAG_MSG_SEQ_NUM: "2",
+                TAG_SENDER_COMP_ID: "CLIENT1",
+                TAG_TARGET_COMP_ID: "EXCHANGE",
+                TAG_SENDING_TIME: "20260707-12:00:01.000",
+                TAG_CL_ORD_ID: "leaky",
+                TAG_SIDE: FIX_SIDE_SELL,
+                TAG_ORD_TYPE: FIX_ORD_TYPE_LIMIT,
+                TAG_PRICE: "100.0000",
+                TAG_ORDER_QTY: "10",
+                TAG_TIME_IN_FORCE: FIX_TIF_DAY,
+                TAG_SYMBOL: "AAPL",
+            }).encode("ascii"))
+            await writer.drain()
+            _, buf = await read_messages(reader, buffer=buf)
+            assert gateway._order_owner, "order was never registered"
+
+            writer.close()
+            await writer.wait_closed()
+
+            # The handler's exit is not ordered against this coroutine, so poll
+            # rather than sleep a guessed interval.
+            for _ in range(200):
+                if not gateway._order_owner:
+                    break
+                await asyncio.sleep(0.01)
+            assert gateway._order_owner == {}
         finally:
             await gateway.stop()
 
@@ -525,7 +706,7 @@ class TestFixGateway:
             })
             writer.write(logon.encode("ascii"))
             await writer.drain()
-            data = await asyncio.wait_for(reader.read(4096), timeout=2.0)
+            _, buf = await read_messages(reader)
 
             # Submit order
             nos = build_message({
@@ -546,7 +727,7 @@ class TestFixGateway:
             await writer.drain()
 
             # Read new ack
-            data = await asyncio.wait_for(reader.read(4096), timeout=2.0)
+            _, buf = await read_messages(reader, buffer=buf)
 
             # Send cancel request
             cancel = build_message({
@@ -564,10 +745,7 @@ class TestFixGateway:
             await writer.drain()
 
             # Read cancel ack
-            data = await asyncio.wait_for(reader.read(4096), timeout=2.0)
-            msg, _ = extract_message(data)
-            assert msg is not None
-            er = parse_message(msg)
+            (er,), buf = await read_messages(reader, buffer=buf)
             assert er[TAG_MSG_TYPE] == MSG_TYPE_EXECUTION_REPORT
             assert er[TAG_EXEC_TYPE] == EXEC_TYPE_CANCELED
             assert er[TAG_ORD_STATUS] == ORD_STATUS_CANCELED
@@ -598,9 +776,7 @@ class TestFixGateway:
             })
             writer.write(logon.encode("ascii"))
             await writer.drain()
-            data = await asyncio.wait_for(reader.read(4096), timeout=2.0)
-            msg, _ = extract_message(data)
-            ack = parse_message(msg)
+            (ack,), buf = await read_messages(reader)
             assert ack[TAG_MSG_TYPE] == MSG_TYPE_LOGON
 
             # 2. Submit sell limit at 50.0
@@ -620,7 +796,7 @@ class TestFixGateway:
             })
             writer.write(sell.encode("ascii"))
             await writer.drain()
-            data = await asyncio.wait_for(reader.read(4096), timeout=2.0)
+            _, buf = await read_messages(reader, buffer=buf)
 
             # 3. Submit buy limit at 50.0 (should fill)
             buy = build_message({
@@ -639,22 +815,17 @@ class TestFixGateway:
             })
             writer.write(buy.encode("ascii"))
             await writer.drain()
-            data = await asyncio.wait_for(reader.read(8192), timeout=2.0)
-            buffer = data
-            messages = []
-            while True:
-                m, buffer = extract_message(buffer)
-                if m is None:
-                    break
-                messages.append(parse_message(m))
+            # New ack for the buy, its fill, and the resting sell's fill.
+            messages, buf = await read_messages(reader, count=3, buffer=buf)
 
-            # Should have New + Fill for buy
-            buy_fills = [
-                m for m in messages
-                if m.get(TAG_CL_ORD_ID) == "B001"
-                and m.get(TAG_EXEC_TYPE) == EXEC_TYPE_FILL
-            ]
-            assert len(buy_fills) == 1
+            for cl_ord_id in ("B001", "S001"):
+                fills = [
+                    m for m in messages
+                    if m.get(TAG_CL_ORD_ID) == cl_ord_id
+                    and m.get(TAG_EXEC_TYPE) == EXEC_TYPE_FILL
+                ]
+                assert len(fills) == 1, cl_ord_id
+                assert fills[0][TAG_ORD_STATUS] == ORD_STATUS_FILLED
 
             # 4. Logout
             logout = build_message({
@@ -666,11 +837,8 @@ class TestFixGateway:
             })
             writer.write(logout.encode("ascii"))
             await writer.drain()
-            data = await asyncio.wait_for(reader.read(4096), timeout=2.0)
-            msg, _ = extract_message(data)
-            if msg:
-                resp = parse_message(msg)
-                assert resp[TAG_MSG_TYPE] == MSG_TYPE_LOGOUT
+            (resp,), buf = await read_messages(reader, buffer=buf)
+            assert resp[TAG_MSG_TYPE] == MSG_TYPE_LOGOUT
 
             writer.close()
             await writer.wait_closed()

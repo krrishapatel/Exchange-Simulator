@@ -97,6 +97,10 @@ class ClientConnection:
         # Track cumulative fills per order
         self._cum_qty: dict[str, int] = {}
         self._cum_value: dict[str, float] = {}
+        # ClOrdID -> the order's own side, quantity, price and symbol. A fill
+        # against a resting order has to be reported with that order's terms,
+        # not with the terms of the incoming order that hit it.
+        self._orders: dict[str, dict] = {}
 
     async def send_raw(self, data: str) -> None:
         """Send raw FIX message bytes to the client."""
@@ -209,6 +213,14 @@ class ClientConnection:
         self._id_to_cl_ord[internal_id] = cl_ord_id
         self._cum_qty[cl_ord_id] = 0
         self._cum_value[cl_ord_id] = 0.0
+        self._orders[cl_ord_id] = {
+            "order_id": internal_id,
+            "side": fix_side,
+            "quantity": quantity,
+            "price": price,
+            "symbol": fields.get(TAG_SYMBOL, "N/A"),
+        }
+        self.gateway._order_owner[internal_id] = self
 
         # Build engine Order
         order = ex.Order()
@@ -238,36 +250,70 @@ class ClientConnection:
             symbol=fields.get(TAG_SYMBOL, "N/A"),
         )
 
-        # Process fills
+        # Process fills. Every fill has two sides, and both of them are somebody's
+        # order: the incoming one, and the resting one it traded against. Both
+        # owners get a report.
         for fill in fills:
-            self._cum_qty[cl_ord_id] += fill.quantity
-            fill_price_float = fill.price / PRICE_SCALE
-            self._cum_value[cl_ord_id] += fill.quantity * fill_price_float
+            await self._report_fill(cl_ord_id, fill)
 
-            cum_qty = self._cum_qty[cl_ord_id]
-            leaves_qty = quantity - cum_qty
-
-            if leaves_qty <= 0:
-                exec_type = EXEC_TYPE_FILL
-                ord_status = ORD_STATUS_FILLED
-            else:
-                exec_type = EXEC_TYPE_PARTIAL_FILL
-                ord_status = ORD_STATUS_PARTIALLY_FILLED
-
-            await self._send_execution_report(
-                cl_ord_id=cl_ord_id,
-                order_id=str(internal_id),
-                exec_type=exec_type,
-                ord_status=ord_status,
-                side=fix_side,
-                quantity=quantity,
-                price=price,
-                cum_qty=cum_qty,
-                leaves_qty=max(0, leaves_qty),
-                last_px=fill.price,
-                last_qty=fill.quantity,
-                symbol=fields.get(TAG_SYMBOL, "N/A"),
+            maker_conn = self.gateway._order_owner.get(fill.maker_order_id)
+            maker_cl_ord_id = (
+                maker_conn._id_to_cl_ord.get(fill.maker_order_id)
+                if maker_conn is not None
+                else None
             )
+            if maker_cl_ord_id is not None:
+                await maker_conn._report_fill(maker_cl_ord_id, fill)
+            else:
+                # An order the gateway never submitted, so there is no session to
+                # report to. Seeded books and direct engine use both land here.
+                logger.debug(
+                    "No FIX owner for maker order %d, fill not reported",
+                    fill.maker_order_id,
+                )
+
+    async def _report_fill(self, cl_ord_id: str, fill) -> None:
+        """Send one fill's ExecutionReport for the order named by `cl_ord_id`.
+
+        Used for both sides of a trade, which is why it reads the order's terms
+        out of `_orders` rather than taking them from whatever message is being
+        handled. Sending a resting order's report with the incoming order's
+        quantity is the bug this shape avoids.
+        """
+        order = self._orders.get(cl_ord_id)
+        if order is None:
+            logger.warning("Fill for untracked order %s, dropped", cl_ord_id)
+            return
+
+        self._cum_qty[cl_ord_id] = self._cum_qty.get(cl_ord_id, 0) + fill.quantity
+        self._cum_value[cl_ord_id] = self._cum_value.get(cl_ord_id, 0.0) + (
+            fill.quantity * (fill.price / PRICE_SCALE)
+        )
+
+        cum_qty = self._cum_qty[cl_ord_id]
+        leaves_qty = order["quantity"] - cum_qty
+
+        if leaves_qty <= 0:
+            exec_type = EXEC_TYPE_FILL
+            ord_status = ORD_STATUS_FILLED
+        else:
+            exec_type = EXEC_TYPE_PARTIAL_FILL
+            ord_status = ORD_STATUS_PARTIALLY_FILLED
+
+        await self._send_execution_report(
+            cl_ord_id=cl_ord_id,
+            order_id=str(order["order_id"]),
+            exec_type=exec_type,
+            ord_status=ord_status,
+            side=order["side"],
+            quantity=order["quantity"],
+            price=order["price"],
+            cum_qty=cum_qty,
+            leaves_qty=max(0, leaves_qty),
+            last_px=fill.price,
+            last_qty=fill.quantity,
+            symbol=order["symbol"],
+        )
 
     async def _handle_cancel(self, fields: dict[str, str]) -> None:
         """Map FIX OrderCancelRequest to engine.cancel()."""
@@ -445,6 +491,11 @@ class FixGateway:
         self.comp_id = comp_id
         self._server: asyncio.Server | None = None
         self._connections: list[ClientConnection] = []
+        # Internal order ID -> the connection that submitted it. Order books are
+        # shared across sessions, so the resting side of a fill usually belongs
+        # to a different client than the incoming order, and this is what makes
+        # its execution report reachable.
+        self._order_owner: dict[int, ClientConnection] = {}
         self._order_id_counter = 0
         self._exec_id_counter = 0
 
@@ -468,19 +519,37 @@ class FixGateway:
         logger.info("FIX gateway listening on %s:%d", self.host, self.port)
 
     async def stop(self) -> None:
-        """Stop the FIX gateway server and close all connections."""
-        if self._server:
-            self._server.close()
-            await self._server.wait_closed()
-            self._server = None
+        """Stop the FIX gateway server and close all connections.
 
-        for conn in self._connections:
+        Order matters. Since Python 3.12, Server.wait_closed() waits on the
+        connection handlers, and a handler sits in a read that only returns once
+        its client goes away, so awaiting the server while a client is still
+        attached hangs for as long as that client stays. Closing the client
+        connections first lets the handlers reach their exit.
+
+        It is not a barrier in the other direction, though: wait_closed() can
+        return before every handler has actually run its cleanup, which is why
+        anything this method needs to be true afterwards is done here rather than
+        left to the handlers.
+        """
+        # list() because a handler removes itself from _connections as it exits.
+        for conn in list(self._connections):
             conn.writer.close()
             try:
                 await conn.writer.wait_closed()
             except Exception:
                 pass
         self._connections.clear()
+
+        # Every session is going away, so no order has anywhere to be reported
+        # to. Cleared here rather than left to the per-connection cleanup, per the
+        # ordering caveat above.
+        self._order_owner.clear()
+
+        if self._server:
+            self._server.close()
+            await self._server.wait_closed()
+            self._server = None
 
     async def _handle_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -504,6 +573,12 @@ class FixGateway:
         finally:
             if conn in self._connections:
                 self._connections.remove(conn)
+            # Drop this connection's orders from the owner map. Without this the
+            # map grows for the life of the process and a later fill tries to
+            # report down a socket that is already gone.
+            for order_id in list(conn._id_to_cl_ord):
+                if self._order_owner.get(order_id) is conn:
+                    del self._order_owner[order_id]
             logger.info("Connection closed from %s", peer)
 
     async def serve_forever(self) -> None:
